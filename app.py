@@ -1520,34 +1520,62 @@ raw_html(
        breathing room between links. */
     .st-key-site_navbar [data-testid="stVerticalBlock"]{ gap:6px; }
 
+    /* "☰ Menu" toggle button — a normal nav-style button (inherits the
+       .st-key-site_navbar .stButton styling above), hidden on desktop where
+       every page link already shows inline. Only appears at phone widths. */
+    .st-key-mobile_menu_toggle_wrap{ display:none; }
+
     /* ---------- RESPONSIVE ---------- */
     @media (max-width: 900px){
         .hero-title{ font-size:3rem; }
         .about-wrap{ grid-template-columns:1fr; gap:36px; }
         .price-grid{ grid-template-columns:1fr; }
         .strip{ grid-template-columns:1fr; }
-        .st-key-site_navbar [data-testid="stHorizontalBlock"]{
-            flex-wrap:wrap;
-            justify-content:center;
+
+        /* Show the hamburger toggle only on phone-width screens, and let
+           the logo / toggle / account badge wrap onto their own line if
+           they don't all fit side by side. */
+        .st-key-nav_top_row [data-testid="stHorizontalBlock"]{
+            flex-wrap:wrap !important;
+            row-gap:8px;
         }
-        /* Give each nav pill only the width its own label actually needs
-           instead of an equal forced share — that's what was breaking
-           "Instagram" into "Insta"/"gram" on two lines. Shorter labels
-           (Home, About Me) shrink, longer ones (Instagram, Customers) get
-           the room they need, and the row wraps as a whole if it runs out
-           of space rather than breaking a single word apart. */
-        .st-key-site_navbar [data-testid="stColumn"],
-        .st-key-site_navbar [data-testid="column"]{
-            width:auto !important;
-            flex:0 1 auto !important;
+        .st-key-mobile_menu_toggle_wrap{
+            display:block !important;
+        }
+        .st-key-mobile_menu_toggle_wrap .stButton>button{
+            font-size:0.7rem !important;
+            padding:8px 14px !important;
+            white-space:nowrap !important;
+        }
+
+        /* Page links collapse into a "Menu" dropdown: hidden entirely until
+           the hamburger toggle is pressed, then stacked vertically below
+           the logo/menu-button row. */
+        .st-key-nav_links_closed{ display:none !important; }
+        .st-key-nav_links_open{
+            display:block !important;
+            margin-top:10px;
+            padding-top:10px;
+            border-top:1px solid rgba(212,175,55,0.2);
+        }
+        .st-key-nav_links_open [data-testid="stHorizontalBlock"]{
+            flex-direction:column !important;
+            flex-wrap:nowrap !important;
+            gap:6px !important;
+        }
+        .st-key-nav_links_open [data-testid="stColumn"],
+        .st-key-nav_links_open [data-testid="column"]{
+            width:100% !important;
+            flex:1 1 100% !important;
             min-width:0 !important;
         }
-        .st-key-site_navbar .stButton{ width:auto !important; }
-        .st-key-site_navbar .stButton > button{
-            font-size:0.7rem !important;
-            padding:8px 12px !important;
-            white-space:nowrap !important;
-            width:auto !important;
+        .st-key-nav_links_open .stButton{ width:100% !important; }
+        .st-key-nav_links_open .stButton>button{
+            width:100% !important;
+            text-align:left !important;
+            justify-content:flex-start !important;
+            font-size:0.85rem !important;
+            padding:12px 16px !important;
         }
         .section{ padding:60px 20px; }
         .pillars{ grid-template-columns:1fr; }
@@ -1571,6 +1599,7 @@ raw_html(
 # stripped attributes, no cross-frame hacks.
 def go_to(page_name):
     st.query_params["page"] = page_name
+    st.session_state.mobile_menu_open = False
 
 
 def go_to_service(page_name, service_key):
@@ -1578,32 +1607,61 @@ def go_to_service(page_name, service_key):
     pre-selects the exact service that was pressed."""
     st.session_state.preselect_service = service_key
     st.query_params["page"] = page_name
+    st.session_state.mobile_menu_open = False
 
+
+def toggle_mobile_menu():
+    st.session_state.mobile_menu_open = not st.session_state.mobile_menu_open
+
+
+if "mobile_menu_open" not in st.session_state:
+    st.session_state.mobile_menu_open = False
 
 with st.container(key="site_navbar"):
+    # Top row: logo, a "☰ Menu" toggle (only ever visible on phone-width
+    # screens — plain CSS hides it on desktop), and the account badge.
+    with st.container(key="nav_top_row"):
+        top_cols = st.columns(
+            [1.6, 0.5, 1.3 if st.session_state.user else 0.001],
+            vertical_alignment="center",
+        )
+
+        with top_cols[0]:
+            raw_html(logo_html(42))
+
+        with top_cols[1]:
+            with st.container(key="mobile_menu_toggle_wrap"):
+                st.button(
+                    "✕ Close" if st.session_state.mobile_menu_open else "☰ Menu",
+                    key="mobile_menu_toggle",
+                    on_click=toggle_mobile_menu,
+                    use_container_width=True,
+                )
+
+        if st.session_state.user:
+            with top_cols[2]:
+                first_name = st.session_state.user["name"].split(" ")[0]
+                raw_html(f'<div class="nav-account">Hi, {first_name}</div>')
+
+    # Page links. On desktop these render inline right below the row above
+    # (CSS makes the two rows look seamless, like one navbar). On phone-width
+    # screens they're hidden entirely unless the "☰ Menu" toggle above was
+    # pressed, in which case they stack into a vertical dropdown.
     n_pages = len(VALID_PAGES)
-    col_ratios = [1.6] + [1] * n_pages + [1.3 if st.session_state.user else 0.001]
-    cols = st.columns(col_ratios, vertical_alignment="center")
-
-    with cols[0]:
-        raw_html(logo_html(42))
-
-    for i, page_name in enumerate(VALID_PAGES):
-        with cols[i + 1]:
-            is_active = current_page == page_name
-            st.button(
-                "Your Appts" if page_name == "Your Appointments" else page_name,
-                key=f"navbtn_{page_name}",
-                on_click=go_to,
-                args=(page_name,),
-                type="primary" if is_active else "secondary",
-                use_container_width=True,
-            )
-
-    if st.session_state.user:
-        with cols[-1]:
-            first_name = st.session_state.user["name"].split(" ")[0]
-            raw_html(f'<div class="nav-account">Hi, {first_name}</div>')
+    links_key = "nav_links_open" if st.session_state.mobile_menu_open else "nav_links_closed"
+    with st.container(key=links_key):
+        link_cols = st.columns([1] * n_pages, vertical_alignment="center")
+        for i, page_name in enumerate(VALID_PAGES):
+            with link_cols[i]:
+                is_active = current_page == page_name
+                st.button(
+                    "Your Appts" if page_name == "Your Appointments" else page_name,
+                    key=f"navbtn_{page_name}",
+                    on_click=go_to,
+                    args=(page_name,),
+                    type="primary" if is_active else "secondary",
+                    use_container_width=True,
+                )
 
 # ----------------------------------------------------------------------------
 # HOME PAGE
