@@ -5,6 +5,9 @@ import os
 import re
 import base64
 import calendar as cal_module
+import smtplib
+import ssl
+from email.message import EmailMessage
 from datetime import date, datetime, timedelta
 
 
@@ -30,6 +33,10 @@ def logo_html(height_px=42, extra_style=""):
 # ----------------------------------------------------------------------------
 ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 LOGO_PATH = os.path.join(ASSETS_DIR, "logo.png")
+# Separate, more detailed logo used only inside emails (barber-pole crest with
+# "FADED FOR LESS BARBER") — has a transparent background, so it sits right
+# on top of the black email header with no white box around it.
+EMAIL_LOGO_PATH = os.path.join(ASSETS_DIR, "email_logo.png")
 
 
 @st.cache_data
@@ -77,8 +84,8 @@ STYLE_SHOWCASE = [
 ]
 
 SERVICES = {
-    "Fade or Trim — $10 (30 min)": {"label": "Fade or Trim", "price": "$10", "duration": "30 min"},
-    "Full Haircut — $15 (1 hour)": {"label": "Full Haircut (Fade + Trim)", "price": "$15", "duration": "1 hour"},
+    "Fade or Trim - $10 (30 min)": {"label": "Fade or Trim", "price": "$10", "duration": "30 min"},
+    "Full Haircut - $15 (1 hour)": {"label": "Full Haircut (Fade + Trim)", "price": "$15", "duration": "1 hour"},
 }
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fadedforless.db")
@@ -132,6 +139,14 @@ def init_db():
         )
         """
     )
+    # Migration for DBs created before reminder_sent existed — tracks whether
+    # the "1 hour before" reminder email already went out for an appointment,
+    # so the reminder_worker.py cron job never double-sends one.
+    try:
+        conn.execute("ALTER TABLE appointments ADD COLUMN reminder_sent INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already there
     # Every Style-AI recommendation a customer gets, so the owner can look
     # back at what was said to each person about their hair (Customers tab).
     conn.execute(
@@ -170,6 +185,7 @@ def create_user(name, email, phone, password):
             (name.strip(), email.strip().lower(), phone.strip(), salt, pw_hash, datetime.now().isoformat()),
         )
         conn.commit()
+        notify_signup(name.strip(), email.strip().lower())
         return True, "Account created."
     except sqlite3.IntegrityError:
         return False, "An account with this email already exists."
@@ -238,7 +254,7 @@ def create_appointment(user_id, service_key, appt_date, appt_time, notes):
         (appt_date.isoformat(), appt_time),
     ).fetchone()
     if conflict:
-        return False, "Sorry — that time slot was just booked by someone else. Please pick another."
+        return False, "Sorry - that time slot was just booked by someone else. Please pick another."
     service = SERVICES[service_key]
     conn.execute(
         "INSERT INTO appointments (user_id, service, price, appt_date, appt_time, notes, status, created_at) "
@@ -246,6 +262,9 @@ def create_appointment(user_id, service_key, appt_date, appt_time, notes):
         (user_id, service["label"], service["price"], appt_date.isoformat(), appt_time, notes.strip(), datetime.now().isoformat()),
     )
     conn.commit()
+    user_row = conn.execute("SELECT name, email FROM users WHERE id = ?", (user_id,)).fetchone()
+    if user_row:
+        notify_booking(user_row[0], user_row[1], service["label"], appt_date.isoformat(), appt_time)
     return True, "Appointment booked."
 
 
@@ -261,11 +280,20 @@ def get_appointments(user_id):
 
 def cancel_appointment(appt_id, user_id):
     conn = get_conn()
+    row = conn.execute(
+        "SELECT a.service, a.appt_date, a.appt_time, u.name, u.email "
+        "FROM appointments a JOIN users u ON u.id = a.user_id "
+        "WHERE a.id = ? AND a.user_id = ?",
+        (appt_id, user_id),
+    ).fetchone()
     conn.execute(
         "UPDATE appointments SET status = 'Cancelled' WHERE id = ? AND user_id = ?",
         (appt_id, user_id),
     )
     conn.commit()
+    if row:
+        service, appt_date, appt_time, name, email = row
+        notify_cancel(name, email, service, appt_date, appt_time, by_owner=False)
 
 
 def reschedule_appointment(appt_id, user_id, new_date, new_time):
@@ -276,12 +304,21 @@ def reschedule_appointment(appt_id, user_id, new_date, new_time):
         (new_date.isoformat(), new_time, appt_id),
     ).fetchone()
     if conflict:
-        return False, "Sorry — that time slot was just booked by someone else. Please pick another."
+        return False, "Sorry - that time slot was just booked by someone else. Please pick another."
+    old_row = conn.execute(
+        "SELECT a.service, a.appt_date, a.appt_time, u.name, u.email "
+        "FROM appointments a JOIN users u ON u.id = a.user_id "
+        "WHERE a.id = ? AND a.user_id = ?",
+        (appt_id, user_id),
+    ).fetchone()
     conn.execute(
         "UPDATE appointments SET appt_date = ?, appt_time = ? WHERE id = ? AND user_id = ?",
         (new_date.isoformat(), new_time, appt_id, user_id),
     )
     conn.commit()
+    if old_row:
+        service, old_date, old_time, name, email = old_row
+        notify_reschedule(name, email, service, old_date, old_time, new_date.isoformat(), new_time, by_owner=False)
     return True, "Appointment updated."
 
 
@@ -289,11 +326,19 @@ def admin_cancel_appointment(appt_id):
     """Owner-only cancel — not scoped to a single user_id, since the owner
     manages every customer's bookings."""
     conn = get_conn()
+    row = conn.execute(
+        "SELECT a.service, a.appt_date, a.appt_time, u.name, u.email "
+        "FROM appointments a JOIN users u ON u.id = a.user_id WHERE a.id = ?",
+        (appt_id,),
+    ).fetchone()
     conn.execute(
         "UPDATE appointments SET status = 'Cancelled' WHERE id = ?",
         (appt_id,),
     )
     conn.commit()
+    if row:
+        service, appt_date, appt_time, name, email = row
+        notify_cancel(name, email, service, appt_date, appt_time, by_owner=True)
 
 
 def admin_reschedule_appointment(appt_id, new_date, new_time):
@@ -305,11 +350,19 @@ def admin_reschedule_appointment(appt_id, new_date, new_time):
     ).fetchone()
     if conflict:
         return False, "That time slot is already taken by another appointment."
+    old_row = conn.execute(
+        "SELECT a.service, a.appt_date, a.appt_time, u.name, u.email "
+        "FROM appointments a JOIN users u ON u.id = a.user_id WHERE a.id = ?",
+        (appt_id,),
+    ).fetchone()
     conn.execute(
         "UPDATE appointments SET appt_date = ?, appt_time = ? WHERE id = ?",
         (new_date.isoformat(), new_time, appt_id),
     )
     conn.commit()
+    if old_row:
+        service, old_date, old_time, name, email = old_row
+        notify_reschedule(name, email, service, old_date, old_time, new_date.isoformat(), new_time, by_owner=True)
     return True, "Appointment updated."
 
 
@@ -376,12 +429,12 @@ def get_customer_stats():
             cut_types = ", ".join(seen)
             last_cut = appts[0][0]
         else:
-            cut_types = "—"
-            last_cut = "—"
+            cut_types = "-"
+            last_cut = "-"
         stats.append(
             {
                 "Full Name": name,
-                "Phone": phone or "—",
+                "Phone": phone or "-",
                 "Total Cuts": total_cuts,
                 "Cut Type(s)": cut_types,
                 "Last Cut": last_cut,
@@ -435,7 +488,7 @@ def analyze_style_photo(image_bytes, mime_type="image/jpeg"):
 
     api_key = get_gemini_api_key()
     if not api_key:
-        return False, "Style AI isn't set up yet — ask the shop owner to add a GEMINI_API_KEY."
+        return False, "Style AI isn't set up yet - ask the shop owner to add a GEMINI_API_KEY."
 
     b64_img = base64.b64encode(image_bytes).decode("ascii")
     prompt = (
@@ -476,12 +529,12 @@ def analyze_style_photo(image_bytes, mime_type="image/jpeg"):
         if e.code == 401:
             hint = (
                 " If your key starts with 'AQ.', try restricting it to 'Gemini API only' "
-                "in AI Studio, or generate a new key in a fresh project — this is a known "
+                "in AI Studio, or generate a new key in a fresh project - this is a known "
                 "issue on some Google accounts."
             )
         elif e.code == 404:
             hint = (
-                f" The model '{GEMINI_MODEL}' may have been retired — check "
+                f" The model '{GEMINI_MODEL}' may have been retired - check "
                 "ai.google.dev/gemini-api/docs/models for the current model name and "
                 "update GEMINI_MODEL in app.py."
             )
@@ -513,16 +566,183 @@ ADMIN_EMAIL = os.environ.get("BARBER_ADMIN_EMAIL", "owner@fadedforless.com")
 ADMIN_PASSWORD = os.environ.get("BARBER_ADMIN_PASSWORD", "FadedOwner2026!")
 
 # ----------------------------------------------------------------------------
+# EMAIL NOTIFICATIONS
+# ----------------------------------------------------------------------------
+# Sends real emails through Gmail's SMTP server using an "App Password" (not
+# your normal Gmail password — Google blocks plain-password SMTP logins).
+# The two addresses are fixed per your instructions: faded.for.less@gmail.com
+# SENDS every email, freddiesawiras2@gmail.com is the owner inbox that gets
+# the "your customer did X" alerts. The only thing still missing is the App
+# Password, which has to be set as an environment variable (or in
+# .streamlit/secrets.toml) since it's a secret and shouldn't live in code:
+#   GMAIL_APP_PASSWORD   the 16-character App Password for faded.for.less@gmail.com
+def _get_secret(key, default=""):
+    val = os.environ.get(key, "")
+    if val:
+        return val
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+
+GMAIL_ADDRESS = "faded.for.less@gmail.com"
+GMAIL_APP_PASSWORD = _get_secret("GMAIL_APP_PASSWORD")
+OWNER_EMAIL = "freddiesawiras2@gmail.com"
+
+
+def email_is_configured():
+    return bool(GMAIL_ADDRESS and GMAIL_APP_PASSWORD)
+
+
+def send_email(to_email, subject, html_body):
+    """Sends one HTML email (with the FADEDFORLESS crest logo embedded at
+    the top) via Gmail SMTP. Fails silently (just prints to the server log)
+    instead of raising — a booking or signup should never be blocked just
+    because an email didn't go out."""
+    if not email_is_configured() or not to_email:
+        return False
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = f"FADEDFORLESS <{GMAIL_ADDRESS}>"
+        msg["To"] = to_email
+        msg.set_content("This email requires an HTML-capable email client to view.")
+        msg.add_alternative(html_body, subtype="html")
+        # Embed the logo as an inline image (cid) rather than a hosted URL —
+        # works the same whether the site is deployed or running locally,
+        # and won't break if the site's own image URLs ever change. The
+        # crest logo has a transparent background, so it sits directly on
+        # the black header with no white box around it.
+        if os.path.exists(EMAIL_LOGO_PATH):
+            with open(EMAIL_LOGO_PATH, "rb") as f:
+                logo_bytes = f.read()
+            msg.get_payload()[1].add_related(logo_bytes, maintype="image", subtype="png", cid="<logo>")
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
+            server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+            server.send_message(msg)
+        return True
+    except Exception as e:
+        print(f"[email] Failed to send to {to_email}: {e}")
+        return False
+
+
+def email_wrapper(inner_html):
+    """Wraps any email's body content in the shared FADEDFORLESS look: solid
+    black background top to bottom, gold hairline accents, the crest logo
+    front and center."""
+    return f"""
+    <div style="background:#000000; padding:40px 16px;">
+        <div style="max-width:480px; margin:0 auto; background:#0d0d0d; border:1px solid #D4AF37; border-radius:14px; overflow:hidden; font-family:Arial, Helvetica, sans-serif; box-shadow:0 0 0 1px rgba(212,175,55,0.15);">
+            <div style="background:#000000; padding:32px 24px 24px 24px; text-align:center;">
+                <img src="cid:logo" alt="FADEDFORLESS" style="height:140px; width:auto;" />
+            </div>
+            <div style="height:2px; background:linear-gradient(90deg, transparent, #D4AF37, transparent);"></div>
+            <div style="padding:30px 26px; color:#EDEAE2; font-size:15px; line-height:1.7;">
+                {inner_html}
+            </div>
+            <div style="height:1px; background:rgba(212,175,55,0.25);"></div>
+            <div style="padding:18px 24px; text-align:center; color:#D4AF37; font-size:12px; letter-spacing:1px; text-transform:uppercase;">
+                FADEDFORLESS &middot; Premium cuts. Fair prices.
+            </div>
+        </div>
+    </div>
+    """
+
+
+def pretty_appt(service, appt_date_iso, appt_time):
+    """'Full Haircut on Mon, Aug 10 at 2:00 PM' — used in every email body."""
+    d = datetime.strptime(appt_date_iso, "%Y-%m-%d").strftime("%a, %b %d, %Y")
+    return f"{service} on {d} at {appt_time}"
+
+
+def notify_signup(name, email):
+    send_email(
+        email,
+        "Welcome to FADEDFORLESS",
+        email_wrapper(
+            f"<p>Hey {name},</p>"
+            "<p>Your account is set up. You can now book appointments, reschedule, "
+            "and get style recommendations any time.</p>"
+            "<p>- FADEDFORLESS</p>"
+        ),
+    )
+    send_email(
+        OWNER_EMAIL,
+        "New account created",
+        email_wrapper(f"<p>{name} ({email}) just created an account.</p>"),
+    )
+
+
+def notify_booking(name, email, service, appt_date_iso, appt_time):
+    details = pretty_appt(service, appt_date_iso, appt_time)
+    send_email(
+        email,
+        "Appointment Confirmed - FADEDFORLESS",
+        email_wrapper(
+            f"<p>Hey {name},</p>"
+            f"<p>You're booked for:<br><strong>{details}</strong></p>"
+            "<p>We'll send you a reminder 1 hour before. See you then.</p>"
+            "<p>- FADEDFORLESS</p>"
+        ),
+    )
+    send_email(
+        OWNER_EMAIL,
+        "New booking",
+        email_wrapper(f"<p>{name} booked an appointment.</p><p><strong>{details}</strong></p>"),
+    )
+
+
+def notify_cancel(name, email, service, appt_date_iso, appt_time, by_owner=False):
+    details = pretty_appt(service, appt_date_iso, appt_time)
+    send_email(
+        email,
+        "Appointment Cancelled - FADEDFORLESS",
+        email_wrapper(
+            f"<p>Hey {name},</p>"
+            f"<p>This appointment has been cancelled:<br><strong>{details}</strong></p>"
+            "<p>Head back to the site any time to book a new one.</p>"
+            "<p>- FADEDFORLESS</p>"
+        ),
+    )
+    who = "The owner" if by_owner else name
+    send_email(
+        OWNER_EMAIL,
+        "Appointment cancelled",
+        email_wrapper(f"<p>{who} cancelled {name}'s appointment.</p><p><strong>{details}</strong></p>"),
+    )
+
+
+def notify_reschedule(name, email, service, old_date_iso, old_time, new_date_iso, new_time, by_owner=False):
+    old_details = pretty_appt(service, old_date_iso, old_time)
+    new_details = pretty_appt(service, new_date_iso, new_time)
+    send_email(
+        email,
+        "Appointment Updated - FADEDFORLESS",
+        email_wrapper(
+            f"<p>Hey {name},</p>"
+            "<p>Your appointment was moved.</p>"
+            f"<p>Old time: {old_details}<br>New time: <strong>{new_details}</strong></p>"
+            "<p>- FADEDFORLESS</p>"
+        ),
+    )
+    who = "The owner" if by_owner else name
+    send_email(
+        OWNER_EMAIL,
+        "Appointment rescheduled",
+        email_wrapper(
+            f"<p>{who} rescheduled {name}'s appointment.</p>"
+            f"<p>Old time: {old_details}<br>New time: <strong>{new_details}</strong></p>"
+        ),
+    )
+
+
+# ----------------------------------------------------------------------------
 # ROUTING (query params drive the "pages")
 # ----------------------------------------------------------------------------
 if "user" not in st.session_state:
     st.session_state.user = None
-if "phone_mode" not in st.session_state:
-    st.session_state.phone_mode = False
-if "device_asked" not in st.session_state:
-    st.session_state.device_asked = False
-if "mobile_nav_open" not in st.session_state:
-    st.session_state.mobile_nav_open = False
 
 BASE_PAGES = ["Home", "About Me", "Pricing", "Book Now", "Instagram"]
 IS_ADMIN = bool(st.session_state.user and st.session_state.user.get("is_admin"))
@@ -1292,28 +1512,6 @@ raw_html(
     }
     .footer span{ color:var(--gold); }
 
-    /* ---------- PHONE MODE TOGGLE ---------- */
-    /* Small, out-of-the-way switch to re-check the device choice later —
-       the main decision happens once via the on-load prompt (see
-       "DEVICE PROMPT" below), so this just needs to stay out of the way. */
-    .st-key-phone_mode_toggle{
-        position:fixed;
-        bottom:12px;
-        right:12px;
-        z-index:1001;
-        background:rgba(7,7,7,0.85);
-        border:1px solid rgba(212,175,55,0.35);
-        border-radius:14px;
-        padding:2px 8px;
-        backdrop-filter:blur(6px);
-        transform:scale(0.8);
-        transform-origin:bottom right;
-    }
-    .st-key-phone_mode_toggle label p{
-        color:#F5F1E6 !important;
-        font-size:0.7rem !important;
-    }
-
     /* ---------- COLLAPSIBLE MOBILE NAV (phone mode) ---------- */
     /* When the hamburger menu is open, each page link is its own stacked
        st.button inside the navbar's vertical block — give it a little
@@ -1356,290 +1554,6 @@ raw_html(
     """.replace("__IMG_HERO__", IMG_HERO)
 )
 
-if st.session_state.phone_mode:
-    # These rules mirror the @media(max-width:900px) rules above, but apply
-    # unconditionally — @media only reacts to the real browser viewport, and
-    # someone testing "phone mode" on a desktop browser has a wide viewport,
-    # so the layout has to be forced narrow here instead of relying on that.
-    raw_html(
-        """
-        <style>
-        html{ background:#000; }
-        .stApp{
-            max-width:430px;
-            margin:0 auto;
-            border-left:1px solid rgba(212,175,55,0.3);
-            border-right:1px solid rgba(212,175,55,0.3);
-            box-shadow:0 0 80px rgba(0,0,0,0.85);
-        }
-        /* Streamlit's own built-in menu (the small icon it adds in the very
-           top corner of every app, separate from our own "☰ Menu" pill) sits
-           right on top of our navbar in this narrow width and is easy to tap
-           by mistake. One of its options is a "Wide mode" switch, which is
-           what was silently snapping the page back to a wide/desktop-looking
-           layout after a second tap near the top of the screen. Hiding it
-           means the only menu people can reach is our own. */
-        header[data-testid="stHeader"]{ display:none !important; }
-        #MainMenu{ visibility:hidden !important; }
-        .st-key-site_navbar{ padding:12px 16px; }
-        .st-key-mobile_nav_list .stButton > button{ text-align:left; }
-        /* The dropdown used to just be a normal stacked block, so it pushed
-           the whole page down and had no way to dismiss it except finding
-           the tiny "Close" pill again — on the owner account (which has
-           extra pages: Your Appointments, Customers, Settings) that list is
-           long enough it reads as if the "whole menu" took over the screen,
-           with no obvious way to close it. Turn it into a real floating
-           panel instead: an invisible full-screen backdrop button behind it
-           closes the menu on any outside tap, the panel itself floats over
-           the page (doesn't push content), and its own scroll + max-height
-           keep a long admin list from running off-screen. The ✕ Close pill
-           in the top row stays outside both of these, so it's always
-           reachable too. */
-        .st-key-site_navbar{ position:sticky; }
-        .st-key-mobile_nav_backdrop{
-            position:absolute;
-            top:100%; left:0; right:0;
-            height:100vh;
-            z-index:1000;
-            background:rgba(0,0,0,0.45);
-        }
-        .st-key-mobile_nav_backdrop .stButton{ width:100%; height:100%; margin:0; }
-        .st-key-mobile_nav_backdrop .stButton > button{
-            width:100%; height:100%;
-            background:transparent !important;
-            border:none !important;
-            box-shadow:none !important;
-            padding:0 !important;
-        }
-        .st-key-mobile_nav_backdrop .stButton > button p,
-        .st-key-mobile_nav_backdrop .stButton > button span{
-            opacity:0 !important;
-        }
-        .st-key-mobile_nav_list{
-            position:absolute;
-            top:100%; left:16px; right:16px;
-            margin-top:8px;
-            z-index:1001;
-            background:var(--charcoal-2, #141414);
-            border:1px solid rgba(212,175,55,0.35);
-            border-radius:12px;
-            padding:12px;
-            max-height:65vh;
-            overflow-y:auto;
-            box-shadow:0 16px 40px rgba(0,0,0,0.6);
-        }
-        .st-key-phone_mode_toggle{ right:calc(50% - 203px); }
-        /* ---- Buttons in general: never let label text wrap letter-by-letter
-           when a column gets squeezed (Change Time / Cancel side-by-side,
-           Log Out, etc.) — keep it on one line and shrink to fit instead. ---- */
-        .stButton > button{
-            white-space:nowrap !important;
-            font-size:0.85rem !important;
-            padding:8px 14px !important;
-        }
-        .hero-title{ font-size:2.2rem !important; }
-        .about-wrap{ grid-template-columns:1fr !important; gap:28px !important; }
-        .price-grid{ grid-template-columns:1fr !important; }
-        .strip{ grid-template-columns:1fr !important; }
-        .pillars{ grid-template-columns:1fr !important; }
-        .section{ padding:40px 16px !important; }
-        .block-container{ padding-left:0.5rem !important; padding-right:0.5rem !important; }
-        [data-testid="stHorizontalBlock"]{ flex-wrap:wrap !important; }
-
-        /* ---- HOME: hero "Book Now" / "View Pricing" buttons ---- */
-        /* These sit in a 3-column row (button, button, empty spacer) that
-           was squeezing/overlapping at phone width — stack them full-width
-           instead. */
-        .st-key-hero_cta [data-testid="stHorizontalBlock"]{ flex-direction:column !important; flex-wrap:nowrap !important; }
-        .st-key-hero_cta [data-testid="stColumn"], .st-key-hero_cta [data-testid="column"]{ width:100% !important; flex:1 1 100% !important; }
-        .st-key-hero_cta .stButton{ width:100%; margin-bottom:10px; }
-        .st-key-hero_cta .stButton > button{ width:100% !important; }
-
-        /* ---- STYLE RECOMMENDATION: "Send to Freddie" / "Keep Just for
-           Me" buttons ---- */
-        /* Same problem as the hero CTA row: two side-by-side buttons get
-           squeezed at phone width, and since button text is forced to
-           nowrap, the labels were getting clipped ("SEND TO F...",
-           "KEEP JUS..."). Stack them full-width instead so the full
-           label always fits. */
-        .st-key-style_share_buttons [data-testid="stHorizontalBlock"]{ flex-direction:column !important; flex-wrap:nowrap !important; gap:10px !important; }
-        .st-key-style_share_buttons [data-testid="stColumn"], .st-key-style_share_buttons [data-testid="column"]{ width:100% !important; flex:1 1 100% !important; }
-        .st-key-style_share_buttons .stButton{ width:100%; }
-        .st-key-style_share_buttons .stButton > button{ width:100% !important; }
-
-        /* ---- APPOINTMENTS: "Change Time" / "Cancel" and
-           "Save New Time" / "Nevermind" buttons ---- */
-        /* Same clipped-label bug as above, just on containers whose keys
-           are built per-appointment (appt_actions_{id}, reschedule_widget_{id},
-           and their admin equivalents), so a plain .st-key-... selector
-           can't name them all — match on the key prefix instead. The
-           reschedule widget also holds a date/time row we do NOT want to
-           stack, so only target the inner row that actually has buttons. */
-        [class*="st-key-appt_actions_"] [data-testid="stHorizontalBlock"],
-        [class*="st-key-admin_appt_actions_"] [data-testid="stHorizontalBlock"],
-        [class*="st-key-reschedule_widget_"] [data-testid="stHorizontalBlock"]:has(.stButton),
-        [class*="st-key-admin_reschedule_widget_"] [data-testid="stHorizontalBlock"]:has(.stButton){
-            flex-direction:column !important;
-            flex-wrap:nowrap !important;
-            gap:10px !important;
-        }
-        [class*="st-key-appt_actions_"] [data-testid="stColumn"],
-        [class*="st-key-admin_appt_actions_"] [data-testid="stColumn"],
-        [class*="st-key-reschedule_widget_"] [data-testid="stHorizontalBlock"]:has(.stButton) [data-testid="stColumn"],
-        [class*="st-key-admin_reschedule_widget_"] [data-testid="stHorizontalBlock"]:has(.stButton) [data-testid="stColumn"]{
-            width:100% !important;
-            flex:1 1 100% !important;
-        }
-        [class*="st-key-appt_actions_"] .stButton,
-        [class*="st-key-admin_appt_actions_"] .stButton,
-        [class*="st-key-reschedule_widget_"] .stButton,
-        [class*="st-key-admin_reschedule_widget_"] .stButton{ width:100%; }
-        [class*="st-key-appt_actions_"] .stButton > button,
-        [class*="st-key-admin_appt_actions_"] .stButton > button,
-        [class*="st-key-reschedule_widget_"] .stButton > button,
-        [class*="st-key-admin_reschedule_widget_"] .stButton > button{ width:100% !important; }
-
-        /* ---- Standalone action buttons: "Get My Recommendation",
-           "Confirm Appointment", "Log Out" (both accounts) ---- */
-        /* These were left at their default fit-content width, so on a
-           430px phone frame they sat small and off to one side instead of
-           matching the full-width gold-pill treatment every other primary
-           button on the page gets. Also, the customer's "Log Out" button
-           lived in a cramped 1-of-4 column next to the welcome heading —
-           stack that row so the heading and button each get full width. */
-        .st-key-style_analyze_btn .stButton > button,
-        .st-key-style_analyze_btn > button,
-        .st-key-booking_confirm_btn .stButton > button,
-        .st-key-booking_confirm_btn > button,
-        .st-key-logout_freddie .stButton > button,
-        .st-key-logout_freddie > button{
-            width:100% !important;
-        }
-        .st-key-customer_header [data-testid="stHorizontalBlock"]{
-            flex-direction:column !important;
-            flex-wrap:nowrap !important;
-            gap:10px !important;
-        }
-        .st-key-customer_header [data-testid="stColumn"]{
-            width:100% !important;
-            flex:1 1 100% !important;
-        }
-        .st-key-customer_header .stButton{ width:100%; }
-        .st-key-customer_header .stButton > button{ width:100% !important; }
-
-        /* ---- STYLE AI: bigger/wider camera preview + photo ---- */
-        /* The camera widget (live preview, captured photo, and file-uploader
-           fallback) was boxed into the same narrow centered column as
-           everything else, so on phone it looked cramped. Let it fill the
-           available width and give the frame more height so the photo
-           itself reads clearly. */
-        .st-key-style_photo_widget [data-testid="stCameraInput"],
-        .st-key-style_photo_widget video,
-        .st-key-style_photo_widget img{
-            width:100% !important;
-            max-width:100% !important;
-            min-height:340px !important;
-            object-fit:cover !important;
-            border-radius:8px !important;
-        }
-
-        /* ---- PRICING: $10 / $15 cards ---- */
-        /* Stack the two cards instead of squeezing them side by side, and
-           trim each card down (smaller image, less copy, tighter padding)
-           so it reads well at phone width. */
-        .st-key-pricing_grid [data-testid="stHorizontalBlock"]{ flex-direction:column !important; flex-wrap:nowrap !important; gap:18px !important; }
-        .st-key-pricing_grid [data-testid="stColumn"], .st-key-pricing_grid [data-testid="column"]{ width:100% !important; flex:1 1 100% !important; }
-        .st-key-pricing_grid .price-card-img{ height:110px !important; }
-        .st-key-pricing_grid .price-card-body{ padding:18px 18px 20px 18px !important; }
-        .st-key-pricing_grid .price-amount{ font-size:2.1rem !important; margin-bottom:0 !important; }
-        .st-key-pricing_grid .price-desc{ display:none !important; }
-        .st-key-pricing_grid .price-meta{ margin:10px 0 12px 0 !important; }
-        .st-key-pricing_grid .badge{ top:10px !important; right:10px !important; font-size:0.6rem !important; padding:5px 10px !important; }
-
-        /* ---- BOOK NOW: Log In / Sign Up tabs ---- */
-        /* Make the two tab buttons bigger, full-width, and stacked instead
-           of a cramped side-by-side pair. */
-        .st-key-auth_tabs .stTabs [data-baseweb="tab-list"]{
-            flex-direction:column !important;
-            width:100% !important;
-            gap:8px !important;
-            border-bottom:none !important;
-        }
-        .st-key-auth_tabs .stTabs [data-baseweb="tab"]{
-            width:100% !important;
-            justify-content:center !important;
-            font-size:1rem !important;
-            padding:14px 10px !important;
-            border:1px solid rgba(212,175,55,0.3) !important;
-            border-radius:8px !important;
-        }
-        .st-key-auth_tabs .stTabs [aria-selected="true"]{
-            background:rgba(212,175,55,0.12) !important;
-            border-color:var(--gold) !important;
-        }
-        </style>
-        """
-    )
-
-# ----------------------------------------------------------------------------
-# DEVICE PROMPT — asked once, right when the site loads, instead of making
-# people find and tap a small toggle. Their choice sets phone_mode above;
-# the toggle stays around afterward only in case they want to switch it.
-# ----------------------------------------------------------------------------
-def choose_device(is_phone):
-    st.session_state.phone_mode = is_phone
-    st.session_state.device_asked = True
-    # Bake the choice into the URL too (not just server-side session state).
-    # Mobile browsers sometimes reload a backgrounded tab, which starts a
-    # brand-new session and would otherwise silently reset us to the "computer"
-    # default — but the URL survives that reload, so we can recover from it.
-    st.query_params["view"] = "phone" if is_phone else "desktop"
-
-
-# Recover the device choice from the URL if this is technically a fresh
-# session (device_asked is False) but the address bar still remembers a
-# previous choice — this is what stops phone mode from randomly reverting
-# to the wide "computer" layout after the browser reloads the tab.
-if not st.session_state.device_asked and st.query_params.get("view") in ("phone", "desktop"):
-    st.session_state.phone_mode = st.query_params.get("view") == "phone"
-    st.session_state.device_asked = True
-
-if not st.session_state.device_asked:
-    raw_html(
-        f"""
-        <div style="min-height:60vh; display:flex; flex-direction:column;
-                    align-items:center; justify-content:center; text-align:center; padding:24px;">
-            {logo_html(96, "margin:0 auto 24px auto;")}
-            <h2 style="margin-bottom:8px;">How are you viewing this?</h2>
-            <p style="color:var(--text-muted); max-width:340px; margin:0 auto;">
-                We'll size the site to fit your screen.
-            </p>
-        </div>
-        """
-    )
-    prompt_l, prompt_mid, prompt_r = st.columns([1, 1.6, 1])
-    with prompt_mid:
-        pick_a, pick_b = st.columns(2)
-        with pick_a:
-            st.button(
-                "💻 Computer",
-                key="pick_computer",
-                use_container_width=True,
-                type="primary",
-                on_click=choose_device,
-                args=(False,),
-            )
-        with pick_b:
-            st.button(
-                "📱 Phone",
-                key="pick_phone",
-                use_container_width=True,
-                type="primary",
-                on_click=choose_device,
-                args=(True,),
-            )
-    st.stop()
-
 # ----------------------------------------------------------------------------
 # NAVBAR
 # ----------------------------------------------------------------------------
@@ -1655,7 +1569,6 @@ if not st.session_state.device_asked:
 # stripped attributes, no cross-frame hacks.
 def go_to(page_name):
     st.query_params["page"] = page_name
-    st.session_state.mobile_nav_open = False  # tapping a link closes the phone-mode menu
 
 
 def go_to_service(page_name, service_key):
@@ -1665,75 +1578,30 @@ def go_to_service(page_name, service_key):
     st.query_params["page"] = page_name
 
 
-def toggle_mobile_nav():
-    st.session_state.mobile_nav_open = not st.session_state.mobile_nav_open
+with st.container(key="site_navbar"):
+    n_pages = len(VALID_PAGES)
+    col_ratios = [1.6] + [1] * n_pages + [1.3 if st.session_state.user else 0.001]
+    cols = st.columns(col_ratios, vertical_alignment="center")
 
+    with cols[0]:
+        raw_html(logo_html(42))
 
-# ----------------------------------------------------------------------------
-# NOTE: the standalone "📱 Phone" toggle that used to float here was removed —
-# the device view switch now lives in the Settings tab instead.
-# ----------------------------------------------------------------------------
-if st.session_state.phone_mode:
-    with st.container(key="site_navbar"):
-        top_cols = st.columns([1.6, 1, 1.3 if st.session_state.user else 0.001], vertical_alignment="center")
-        with top_cols[0]:
-            raw_html(logo_html(34))
-        with top_cols[1]:
+    for i, page_name in enumerate(VALID_PAGES):
+        with cols[i + 1]:
+            is_active = current_page == page_name
             st.button(
-                "✕ Close" if st.session_state.mobile_nav_open else "☰ Menu",
-                key="mobile_nav_toggle_btn",
-                on_click=toggle_mobile_nav,
+                "Your Appts" if page_name == "Your Appointments" else page_name,
+                key=f"navbtn_{page_name}",
+                on_click=go_to,
+                args=(page_name,),
+                type="primary" if is_active else "secondary",
                 use_container_width=True,
             )
-        if st.session_state.user:
-            with top_cols[-1]:
-                first_name = st.session_state.user["name"].split(" ")[0]
-                raw_html(f'<div class="nav-account">Hi, {first_name}</div>')
 
-        if st.session_state.mobile_nav_open:
-            with st.container(key="mobile_nav_backdrop"):
-                st.button(
-                    "Close menu",
-                    key="mobile_nav_backdrop_btn",
-                    on_click=toggle_mobile_nav,
-                    use_container_width=True,
-                )
-            with st.container(key="mobile_nav_list"):
-                for page_name in VALID_PAGES:
-                    is_active = current_page == page_name
-                    st.button(
-                        "Your Appts" if page_name == "Your Appointments" else page_name,
-                        key=f"navbtn_mobile_{page_name}",
-                        on_click=go_to,
-                        args=(page_name,),
-                        type="primary" if is_active else "secondary",
-                        use_container_width=True,
-                    )
-else:
-    with st.container(key="site_navbar"):
-        n_pages = len(VALID_PAGES)
-        col_ratios = [1.6] + [1] * n_pages + [1.3 if st.session_state.user else 0.001]
-        cols = st.columns(col_ratios, vertical_alignment="center")
-
-        with cols[0]:
-            raw_html(logo_html(42))
-
-        for i, page_name in enumerate(VALID_PAGES):
-            with cols[i + 1]:
-                is_active = current_page == page_name
-                st.button(
-                    "Your Appts" if page_name == "Your Appointments" else page_name,
-                    key=f"navbtn_{page_name}",
-                    on_click=go_to,
-                    args=(page_name,),
-                    type="primary" if is_active else "secondary",
-                    use_container_width=True,
-                )
-
-        if st.session_state.user:
-            with cols[-1]:
-                first_name = st.session_state.user["name"].split(" ")[0]
-                raw_html(f'<div class="nav-account">Hi, {first_name}</div>')
+    if st.session_state.user:
+        with cols[-1]:
+            first_name = st.session_state.user["name"].split(" ")[0]
+            raw_html(f'<div class="nav-account">Hi, {first_name}</div>')
 
 # ----------------------------------------------------------------------------
 # HOME PAGE
@@ -1748,7 +1616,7 @@ def render_home():
                 <h1 class="hero-title">FADED<span class="gold-grad">FOR</span>LESS</h1>
                 <div class="hero-tagline">Premium cuts. Fair prices. No unnecessary markup.</div>
                 <p class="hero-desc">
-                    The goal is simple — quality barbering at a price that actually makes sense.
+                    The goal is simple - quality barbering at a price that actually makes sense.
                     Every client gets a clean, precise cut and a professional experience,
                     without paying for the markup that comes with it.
                 </p>
@@ -1782,7 +1650,7 @@ def render_home():
                 <div class="eyebrow">The Craft</div>
                 <h2 class="section-title">Precision, every single time</h2>
                 <div class="divider"></div>
-                <p class="section-sub">Six cuts, one standard. See the difference between a mid fade, a low fade, a low taper, a sharp lineup, a clean beard, and an undercut — then book the one you want.</p>
+                <p class="section-sub">Six cuts, one standard. See the difference between a mid fade, a low fade, a low taper, a sharp lineup, a clean beard, and an undercut - then book the one you want.</p>
             </div>
             <div class="style-grid">
                 {style_cards}
@@ -1829,11 +1697,11 @@ def render_about():
                     </div>
                     <p>
                         Every client walks in for a fresh cut and walks out with a full, professional
-                        experience — sharp lines, clean fades, and genuine attention to detail. No
+                        experience - sharp lines, clean fades, and genuine attention to detail. No
                         rushed appointments, no inflated prices for a basic service.
                     </p>
                     <p>
-                        Don't let my age fool you — I've been cutting hair for 4 years and I'm
+                        Don't let my age fool you - I've been cutting hair for 4 years and I'm
                         always working to get better. If you're not sure yet, check out
                         <a href="{INSTAGRAM_URL}" target="_blank" class="gold">@fadedforless on Instagram</a>
                         and see the work for yourself.
@@ -1888,19 +1756,19 @@ def render_pricing():
                                 Choose either a clean fade or a trim. Perfect for keeping your haircut
                                 fresh without spending a lot.
                             </p>
-                            <div class="price-line"><span class="gold-tag">One service — fade or trim, not both</span></div>
+                            <div class="price-line"><span class="gold-tag">One service - fade or trim, not both</span></div>
                         </div>
                     </div>
                     """
                 )
                 with st.container(key="price_link_10"):
                     st.button(
-                        "Book Fade or Trim — $10 →",
+                        "Book Fade or Trim - $10 →",
                         key="pricing_book_10",
                         type="primary",
                         use_container_width=True,
                         on_click=go_to_service,
-                        args=("Book Now", "Fade or Trim — $10 (30 min)"),
+                        args=("Book Now", "Fade or Trim - $10 (30 min)"),
                     )
 
             with col_15:
@@ -1920,19 +1788,19 @@ def render_pricing():
                                 A complete haircut including a clean fade plus a trim for a full,
                                 refreshed look.
                             </p>
-                            <div class="price-line"><span class="gold-tag">The full service — fade and trim together</span></div>
+                            <div class="price-line"><span class="gold-tag">The full service - fade and trim together</span></div>
                         </div>
                     </div>
                     """
                 )
                 with st.container(key="price_link_15"):
                     st.button(
-                        "Book Full Haircut — $15 →",
+                        "Book Full Haircut - $15 →",
                         key="pricing_book_15",
                         type="primary",
                         use_container_width=True,
                         on_click=go_to_service,
-                        args=("Book Now", "Full Haircut — $15 (1 hour)"),
+                        args=("Book Now", "Full Haircut - $15 (1 hour)"),
                     )
 
     st.markdown("<div style='height:20px;'></div>", unsafe_allow_html=True)
@@ -1949,7 +1817,7 @@ def render_book_now():
                 <h2 class="section-title">Reserve your appointment</h2>
                 <div class="divider" style="margin-left:auto; margin-right:auto;"></div>
                 <p class="section-sub" style="margin:14px auto 0 auto;">
-                    Create a free account to book — it keeps your appointment history in one place
+                    Create a free account to book - it keeps your appointment history in one place
                     and makes rebooking quick.
                 </p>
             </div>
@@ -2075,14 +1943,14 @@ def render_book_now():
                         appt_time = None
                         st.selectbox(
                             "Time",
-                            ["Fully booked — pick another day"],
+                            ["Fully booked - pick another day"],
                             disabled=True,
                             key="booking_time_full",
                         )
                 notes = st.text_area("Notes (optional)", placeholder="Anything the barber should know", key="booking_notes")
                 if st.button("Confirm Appointment", key="booking_confirm_btn"):
                     if appt_time is None:
-                        st.error("That day is fully booked — please choose another date.")
+                        st.error("That day is fully booked - please choose another date.")
                     else:
                         ok, msg = create_appointment(user["id"], service_key, appt_date, appt_time, notes or "")
                         if ok:
@@ -2095,7 +1963,7 @@ def render_book_now():
             appts = get_appointments(user["id"])
             if not appts:
                 st.markdown(
-                    '<p style="color:#847f72;">No appointments yet — book your first one above.</p>',
+                    '<p style="color:#847f72;">No appointments yet - book your first one above.</p>',
                     unsafe_allow_html=True,
                 )
             else:
@@ -2134,7 +2002,7 @@ def render_book_now():
                             # as soon as a new date is picked, so it only ever
                             # shows slots that are actually still open.
                             with st.container(key=f"reschedule_widget_{appt_id}"):
-                                st.markdown(f"**Reschedule — {service}**")
+                                st.markdown(f"**Reschedule - {service}**")
                                 rc_a, rc_b = st.columns(2)
                                 with rc_a:
                                     new_date = st.date_input(
@@ -2165,7 +2033,7 @@ def render_book_now():
                                         new_time = None
                                         st.selectbox(
                                             "New time",
-                                            ["Fully booked — pick another day"],
+                                            ["Fully booked - pick another day"],
                                             disabled=True,
                                             key=f"reschedule_time_full_{appt_id}",
                                         )
@@ -2176,7 +2044,7 @@ def render_book_now():
                                     cancel_clicked = st.button("Nevermind", key=f"reschedule_cancel_{appt_id}")
                                 if save_clicked:
                                     if new_time is None:
-                                        st.error("That day is fully booked — please choose another date.")
+                                        st.error("That day is fully booked - please choose another date.")
                                     else:
                                         ok, msg = reschedule_appointment(appt_id, user["id"], new_date, new_time)
                                         if ok:
@@ -2207,7 +2075,7 @@ def render_instagram():
                 <div class="insta-icon">📷</div>
                 <div class="insta-handle">@fadedforless</div>
                 <p class="insta-sub">
-                    Fresh cuts, before-and-afters, and booking updates — all posted on Instagram.
+                    Fresh cuts, before-and-afters, and booking updates - all posted on Instagram.
                     Follow along to see the latest work and stay up to date.
                 </p>
                 <a class="btn-insta" href="{INSTAGRAM_URL}" target="_blank">Follow on Instagram</a>
@@ -2368,7 +2236,7 @@ def render_my_schedule():
                     # Not st.form — same reasoning as the customer reschedule:
                     # the time list must refresh the instant the date changes.
                     with st.container(key=f"admin_reschedule_widget_{appt_id}"):
-                        st.markdown(f"**Reschedule {cust_name} — {service}**")
+                        st.markdown(f"**Reschedule {cust_name} - {service}**")
                         rc_a, rc_b = st.columns(2)
                         with rc_a:
                             new_date = st.date_input(
@@ -2399,7 +2267,7 @@ def render_my_schedule():
                                 new_time = None
                                 st.selectbox(
                                     "New time",
-                                    ["Fully booked — pick another day"],
+                                    ["Fully booked - pick another day"],
                                     disabled=True,
                                     key=f"admin_reschedule_time_full_{appt_id}",
                                 )
@@ -2410,7 +2278,7 @@ def render_my_schedule():
                             cancel_clicked = st.button("Nevermind", key=f"admin_reschedule_cancel_{appt_id}")
                         if save_clicked:
                             if new_time is None:
-                                st.error("That day is fully booked — please choose another date.")
+                                st.error("That day is fully booked - please choose another date.")
                             else:
                                 ok, msg = admin_reschedule_appointment(appt_id, new_date, new_time)
                                 if ok:
@@ -2444,7 +2312,7 @@ def render_customers():
                 <h2 class="section-title">Customer Data</h2>
                 <div class="divider" style="margin-left:auto; margin-right:auto;"></div>
                 <p class="section-sub" style="margin:14px auto 0 auto;">
-                    Every registered customer — full name, phone, how many times they've
+                    Every registered customer - full name, phone, how many times they've
                     come in, and the different haircuts they've gotten.
                 </p>
             </div>
@@ -2545,16 +2413,6 @@ def render_settings():
 
     left, mid, right = st.columns([1, 2.2, 1])
     with mid:
-        st.markdown("#### Display")
-        st.toggle(
-            "📱 Viewing on a phone",
-            key="phone_mode",
-            on_change=lambda: st.query_params.update(
-                {"view": "phone" if st.session_state.phone_mode else "desktop"}
-            ),
-        )
-        st.markdown("<div style='height:24px;'></div>", unsafe_allow_html=True)
-
         if user.get("is_admin"):
             st.markdown(
                 '<p style="color:#847f72;">Profile editing is for customer accounts only.</p>',
@@ -2676,9 +2534,9 @@ def render_style():
                             st.session_state.style_result_decision = "private"
                             st.rerun()
             elif decision == "sent":
-                st.success("Sent to Freddie ✓ — he'll have this before your appointment.")
+                st.success("Sent to Freddie ✓ - he'll have this before your appointment.")
             else:
-                st.info("Kept private — only you can see this.")
+                st.info("Kept private - only you can see this.")
 
     st.markdown("<div style='height:60px;'></div>", unsafe_allow_html=True)
 
@@ -2711,7 +2569,7 @@ elif current_page == "Style":
 raw_html(
     """
     <div class="footer">
-        FADED<span>FOR</span>LESS — Premium cuts. Fair prices.
+        FADED<span>FOR</span>LESS - Premium cuts. Fair prices.
     </div>
     """
 )
