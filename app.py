@@ -745,6 +745,13 @@ raw_html(
         border-radius:12px;
         padding:34px 34px 20px 34px;
     }
+    /* Streamlit auto-adds a "Press Enter to submit form" hint under every
+       text input inside a st.form (login_form, signup_form). It's not our
+       text, so there's nothing to edit in Python — just hide the element
+       Streamlit renders it in. */
+    [data-testid="InputInstructions"]{
+        display:none !important;
+    }
     .stButton>button, .stFormSubmitButton>button{
         background:linear-gradient(120deg, var(--gold-light), var(--gold)) !important;
         color:#0a0a0a !important;
@@ -1376,6 +1383,51 @@ if st.session_state.phone_mode:
         #MainMenu{ visibility:hidden !important; }
         .st-key-site_navbar{ padding:12px 16px; }
         .st-key-mobile_nav_list .stButton > button{ text-align:left; }
+        /* The dropdown used to just be a normal stacked block, so it pushed
+           the whole page down and had no way to dismiss it except finding
+           the tiny "Close" pill again — on the owner account (which has
+           extra pages: Your Appointments, Customers, Settings) that list is
+           long enough it reads as if the "whole menu" took over the screen,
+           with no obvious way to close it. Turn it into a real floating
+           panel instead: an invisible full-screen backdrop button behind it
+           closes the menu on any outside tap, the panel itself floats over
+           the page (doesn't push content), and its own scroll + max-height
+           keep a long admin list from running off-screen. The ✕ Close pill
+           in the top row stays outside both of these, so it's always
+           reachable too. */
+        .st-key-site_navbar{ position:sticky; }
+        .st-key-mobile_nav_backdrop{
+            position:absolute;
+            top:100%; left:0; right:0;
+            height:100vh;
+            z-index:1000;
+            background:rgba(0,0,0,0.45);
+        }
+        .st-key-mobile_nav_backdrop .stButton{ width:100%; height:100%; margin:0; }
+        .st-key-mobile_nav_backdrop .stButton > button{
+            width:100%; height:100%;
+            background:transparent !important;
+            border:none !important;
+            box-shadow:none !important;
+            padding:0 !important;
+        }
+        .st-key-mobile_nav_backdrop .stButton > button p,
+        .st-key-mobile_nav_backdrop .stButton > button span{
+            opacity:0 !important;
+        }
+        .st-key-mobile_nav_list{
+            position:absolute;
+            top:100%; left:16px; right:16px;
+            margin-top:8px;
+            z-index:1001;
+            background:var(--charcoal-2, #141414);
+            border:1px solid rgba(212,175,55,0.35);
+            border-radius:12px;
+            padding:12px;
+            max-height:65vh;
+            overflow-y:auto;
+            box-shadow:0 16px 40px rgba(0,0,0,0.6);
+        }
         .st-key-phone_mode_toggle{ right:calc(50% - 203px); }
         /* ---- Buttons in general: never let label text wrap letter-by-letter
            when a column gets squeezed (Change Time / Cancel side-by-side,
@@ -1639,6 +1691,13 @@ if st.session_state.phone_mode:
                 raw_html(f'<div class="nav-account">Hi, {first_name}</div>')
 
         if st.session_state.mobile_nav_open:
+            with st.container(key="mobile_nav_backdrop"):
+                st.button(
+                    "Close menu",
+                    key="mobile_nav_backdrop_btn",
+                    on_click=toggle_mobile_nav,
+                    use_container_width=True,
+                )
             with st.container(key="mobile_nav_list"):
                 for page_name in VALID_PAGES:
                     is_active = current_page == page_name
