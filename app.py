@@ -72,15 +72,17 @@ IMG_STRIP_1 = "https://images.unsplash.com/photo-1585747860715-2ba37e788b70?w=80
 IMG_STRIP_2 = "https://images.unsplash.com/photo-1621645582931-d1d3e6564943?w=800&q=80&auto=format&fit=crop"
 IMG_STRIP_3 = "https://images.unsplash.com/photo-1536520002442-39764a41e987?w=800&q=80&auto=format&fit=crop"
 
-# Style showcase — real barbering photography, one per featured cut so
-# customers can see exactly what they're booking before they book it.
+# Style showcase — real barbering photography from the shop itself, one per
+# featured cut so customers can see exactly what they're booking before they
+# book it. Loaded locally (same pattern as the logo/owner photo above) so
+# they keep working with no internet dependency once deployed.
 STYLE_SHOWCASE = [
-    {"name": "Mid Fade", "tag": "Fade", "img": "https://images.unsplash.com/photo-1568339434343-2a640a1a9946?w=900&q=80&auto=format&fit=crop"},
-    {"name": "Low Fade", "tag": "Fade", "img": "https://images.unsplash.com/photo-1578390432942-d323db577792?w=900&q=80&auto=format&fit=crop"},
-    {"name": "Low Taper Fade", "tag": "Fade", "img": "https://images.unsplash.com/photo-1635273051839-003bf06a8751?w=900&q=80&auto=format&fit=crop"},
-    {"name": "Lineup", "tag": "Edge Up", "img": "https://images.unsplash.com/photo-1599011176306-4a96f1516d4d?w=900&q=80&auto=format&fit=crop"},
-    {"name": "Beard Trim", "tag": "Beard", "img": "https://images.unsplash.com/photo-1630827020718-3433092696e7?w=900&q=80&auto=format&fit=crop"},
-    {"name": "Undercut", "tag": "Cut", "img": "https://images.unsplash.com/photo-1562004760-aceed7bb0fe3?w=900&q=80&auto=format&fit=crop"},
+    {"name": "Mid Fade", "tag": "Fade", "img": load_image_b64("style_midfade.jpg")},
+    {"name": "Low Fade", "tag": "Fade", "img": load_image_b64("style_lowfade.jpg")},
+    {"name": "Low Taper Fade", "tag": "Fade", "img": load_image_b64("style_lowtaperfade.jpg")},
+    {"name": "Lineup", "tag": "Edge Up", "img": load_image_b64("style_lineup.jpg")},
+    {"name": "Beard Trim", "tag": "Beard", "img": load_image_b64("style_beardtrim.jpg")},
+    {"name": "Undercut", "tag": "Cut", "img": load_image_b64("style_undercut.jpg")},
 ]
 
 SERVICES = {
@@ -1064,11 +1066,12 @@ raw_html(
         display:inline-block;
     }
     .hero-title{
-        font-size:5rem;
+        font-size:clamp(2.1rem, 9vw, 5rem);
         line-height:1.02;
         font-weight:800;
         margin:0 0 20px 0;
         max-width:800px;
+        white-space:nowrap;
     }
     .hero-tagline{
         font-size:1.35rem;
@@ -1527,7 +1530,6 @@ raw_html(
 
     /* ---------- RESPONSIVE ---------- */
     @media (max-width: 900px){
-        .hero-title{ font-size:3rem; }
         .about-wrap{ grid-template-columns:1fr; gap:36px; }
         .price-grid{ grid-template-columns:1fr; }
         .strip{ grid-template-columns:1fr; }
