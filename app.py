@@ -1073,6 +1073,7 @@ raw_html(
         max-width:800px;
         white-space:nowrap;
     }
+    .hero-title .title-break{ display:none; }
     .hero-tagline{
         font-size:1.35rem;
         color:#E8E3D6;
@@ -1530,6 +1531,7 @@ raw_html(
 
     /* ---------- RESPONSIVE ---------- */
     @media (max-width: 900px){
+        .hero-title .title-break{ display:block; }
         .about-wrap{ grid-template-columns:1fr; gap:36px; }
         .price-grid{ grid-template-columns:1fr; }
         .strip{ grid-template-columns:1fr; }
@@ -1675,7 +1677,7 @@ def render_home():
             <div class="hero-bg"></div>
             <div class="hero-content">
                 <div class="eyebrow">Modern Barbering</div>
-                <h1 class="hero-title">FADED<span class="gold-grad">FOR</span>LESS</h1>
+                <h1 class="hero-title">FADED<span class="gold-grad">FOR</span><br class="title-break">LESS</h1>
                 <div class="hero-tagline">Premium cuts. Fair prices. No unnecessary markup.</div>
                 <p class="hero-desc">
                     The goal is simple - quality barbering at a price that actually makes sense.
@@ -1759,11 +1761,11 @@ def render_about():
                     </div>
                     <p>
                         Every client walks in for a fresh cut and walks out with a full, professional
-                        experience - sharp lines, clean fades, and genuine attention to detail. No
+                        experience, with sharp lines, clean fades, and genuine attention to detail. No
                         rushed appointments, no inflated prices for a basic service.
                     </p>
                     <p>
-                        Don't let my age fool you - I've been cutting hair for 4 years and I'm
+                        Don't let my age fool you. I've been cutting hair for 4 years and I'm
                         always working to get better. If you're not sure yet, check out
                         <a href="{INSTAGRAM_URL}" target="_blank" class="gold">@fadedforless on Instagram</a>
                         and see the work for yourself.
