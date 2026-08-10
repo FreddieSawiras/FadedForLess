@@ -595,13 +595,14 @@ def email_is_configured():
     return bool(GMAIL_ADDRESS and GMAIL_APP_PASSWORD)
 
 
-def send_email(to_email, subject, html_body):
-    """Sends one HTML email (with the FADEDFORLESS crest logo embedded at
-    the top) via Gmail SMTP. Fails silently (just prints to the server log)
-    instead of raising — a booking or signup should never be blocked just
-    because an email didn't go out."""
-    if not email_is_configured() or not to_email:
-        return False
+def _send_email_raw(to_email, subject, html_body):
+    """Does the actual send, returns (ok, error_message). error_message is
+    "" on success — this is the version that shows the real reason when
+    something fails, used by the Settings 'Send Test Email' button."""
+    if not email_is_configured():
+        return False, "Not configured: GMAIL_APP_PASSWORD secret is missing or empty."
+    if not to_email:
+        return False, "No recipient email address was given."
     try:
         msg = EmailMessage()
         msg["Subject"] = subject
@@ -609,23 +610,24 @@ def send_email(to_email, subject, html_body):
         msg["To"] = to_email
         msg.set_content("This email requires an HTML-capable email client to view.")
         msg.add_alternative(html_body, subtype="html")
-        # Embed the logo as an inline image (cid) rather than a hosted URL —
-        # works the same whether the site is deployed or running locally,
-        # and won't break if the site's own image URLs ever change. The
-        # crest logo has a transparent background, so it sits directly on
-        # the black header with no white box around it.
-        if os.path.exists(EMAIL_LOGO_PATH):
-            with open(EMAIL_LOGO_PATH, "rb") as f:
-                logo_bytes = f.read()
-            msg.get_payload()[1].add_related(logo_bytes, maintype="image", subtype="png", cid="<logo>")
         context = ssl.create_default_context()
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
             server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
             server.send_message(msg)
-        return True
+        return True, ""
     except Exception as e:
-        print(f"[email] Failed to send to {to_email}: {e}")
-        return False
+        return False, f"{type(e).__name__}: {e}"
+
+
+def send_email(to_email, subject, html_body):
+    """Sends one HTML email via Gmail SMTP. Fails silently (just prints the
+    real error to the server log) instead of raising — a booking or signup
+    should never be blocked just because an email didn't go out. Use
+    _send_email_raw directly if you need to see WHY it failed."""
+    ok, error = _send_email_raw(to_email, subject, html_body)
+    if not ok:
+        print(f"[email] Failed to send to {to_email}: {error}")
+    return ok
 
 
 def email_wrapper(inner_html):
@@ -635,9 +637,6 @@ def email_wrapper(inner_html):
     return f"""
     <div style="background:#000000; padding:40px 16px;">
         <div style="max-width:480px; margin:0 auto; background:#0d0d0d; border:1px solid #D4AF37; border-radius:14px; overflow:hidden; font-family:Arial, Helvetica, sans-serif; box-shadow:0 0 0 1px rgba(212,175,55,0.15);">
-            <div style="background:#000000; padding:32px 24px 24px 24px; text-align:center;">
-                <img src="cid:logo" alt="FADEDFORLESS" style="height:140px; width:auto;" />
-            </div>
             <div style="height:2px; background:linear-gradient(90deg, transparent, #D4AF37, transparent);"></div>
             <div style="padding:30px 26px; color:#EDEAE2; font-size:15px; line-height:1.7;">
                 {inner_html}
@@ -665,6 +664,9 @@ def notify_signup(name, email):
             f"<p>Hey {name},</p>"
             "<p>Your account is set up. You can now book appointments, reschedule, "
             "and get style recommendations any time.</p>"
+            "<p style=\"font-size:13px; color:#b8b3a8;\">Tip: if this email landed in your "
+            "Spam/Junk folder, mark it \"Not Spam\" (or add faded.for.less@gmail.com to your "
+            "contacts) so your booking confirmations and reminders show up in your inbox.</p>"
             "<p>- FADEDFORLESS</p>"
         ),
     )
@@ -1888,7 +1890,12 @@ def render_book_now():
                                     user = verify_login(email, password)
                                     user["is_admin"] = False
                                     st.session_state.user = user
-                                    st.success("Account created! You're now signed in.")
+                                    st.success(
+                                        "Account created! You're now signed in. "
+                                        "Check your inbox for a welcome email - if it's not there, "
+                                        "look in Spam/Junk and mark it 'Not Spam' so future booking "
+                                        "confirmations land in your inbox."
+                                    )
                                     st.rerun()
                                 else:
                                     st.error(msg)
@@ -2414,6 +2421,18 @@ def render_settings():
     left, mid, right = st.columns([1, 2.2, 1])
     with mid:
         if user.get("is_admin"):
+            st.markdown("#### Email Notifications")
+            if email_is_configured():
+                st.markdown(
+                    f'<p style="color:#847f72;">Sending as <strong style="color:#EDEAE2;">{GMAIL_ADDRESS}</strong> &middot; '
+                    f'Owner alerts go to <strong style="color:#EDEAE2;">{OWNER_EMAIL}</strong></p>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    '<p style="color:#e06666;">Not configured — the GMAIL_APP_PASSWORD secret is missing or empty.</p>',
+                    unsafe_allow_html=True,
+                )
             st.markdown(
                 '<p style="color:#847f72;">Profile editing is for customer accounts only.</p>',
                 unsafe_allow_html=True,
