@@ -162,6 +162,17 @@ def init_db():
         )
         """
     )
+    # Simple owner-editable key/value settings — currently used to store the
+    # booking-availability window (start/end time) the owner picks in
+    # Settings, so customers can only book/reschedule inside those hours.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
     conn.commit()
 
 
@@ -405,6 +416,22 @@ def get_style_notes(user_id):
     return rows
 
 
+def get_setting(key, default=None):
+    conn = get_conn()
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def set_setting(key, value):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+    conn.commit()
+
+
 def get_customer_stats():
     """One row per registered customer: full name, phone, how many
     (confirmed) haircuts they've had, and which cut types those were —
@@ -481,9 +508,9 @@ def get_gemini_api_key():
     return key
 
 
-def analyze_style_photo(image_bytes, mime_type="image/jpeg"):
-    """Sends the customer's photo to Gemini and asks for a haircut/fade
-    recommendation. Returns (ok, text_or_error_message)."""
+def _call_gemini(contents):
+    """Shared low-level Gemini caller — takes a ready-made `contents` list
+    (Gemini's multi-turn message format) and returns (ok, text_or_error)."""
     import json
     import urllib.request
     import urllib.error
@@ -492,27 +519,7 @@ def analyze_style_photo(image_bytes, mime_type="image/jpeg"):
     if not api_key:
         return False, "Style AI isn't set up yet - ask the shop owner to add a GEMINI_API_KEY."
 
-    b64_img = base64.b64encode(image_bytes).decode("ascii")
-    prompt = (
-        "You are an expert barber giving a quick in-person consultation. Look at this "
-        "person's face shape, hair texture, and current hair length/style in the photo, "
-        "then recommend a specific haircut. Cover: 1) the best fade type (e.g. low fade, "
-        "mid fade, high fade, taper) and roughly where it should start, 2) whether they "
-        "should keep the top short or long and about how many inches or clipper guard "
-        "length, 3) any quick styling or beard-pairing notes. Write it as one short, "
-        "friendly paragraph a barber would say in the chair — no headers, no markdown, "
-        "no bullet points."
-    )
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"inline_data": {"mime_type": mime_type, "data": b64_img}},
-                    {"text": prompt},
-                ]
-            }
-        ]
-    }
+    payload = {"contents": contents}
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
     req = urllib.request.Request(
         url,
@@ -545,17 +552,100 @@ def analyze_style_photo(image_bytes, mime_type="image/jpeg"):
         return False, f"Couldn't reach the Style AI right now ({e})."
 
 
-def generate_time_slots():
+def analyze_style_photo(image_bytes, mime_type="image/jpeg"):
+    """Sends the customer's photo to Gemini and asks for a haircut/fade
+    recommendation. Returns (ok, text_or_error_message)."""
+    b64_img = base64.b64encode(image_bytes).decode("ascii")
+    prompt = (
+        "You are an expert barber giving a quick in-person consultation. Look at this "
+        "person's face shape, hair texture, and current hair length/style in the photo, "
+        "then recommend a specific haircut. Cover: 1) the best fade type (e.g. low fade, "
+        "mid fade, high fade, taper) and roughly where it should start, 2) whether they "
+        "should keep the top short or long and about how many inches or clipper guard "
+        "length, 3) any quick styling or beard-pairing notes. Write it as one short, "
+        "friendly paragraph a barber would say in the chair — no headers, no markdown, "
+        "no bullet points."
+    )
+    contents = [
+        {
+            "role": "user",
+            "parts": [
+                {"inline_data": {"mime_type": mime_type, "data": b64_img}},
+                {"text": prompt},
+            ],
+        }
+    ]
+    return _call_gemini(contents)
+
+
+def analyze_style_photos_owner(photos):
+    """Owner-only version — takes three photos (back, side, top/front) of a
+    customer's head and asks Gemini for a full cutting plan: what to do on
+    top, which fade (if any), and whether the fade should be sides-only.
+    `photos` is a list of (image_bytes, mime_type) tuples in that order.
+    Returns (ok, text_or_error_message)."""
+    labels = ["back of the head", "side of the head", "top/front of the head"]
+    parts = []
+    for (image_bytes, mime_type), label in zip(photos, labels):
+        b64_img = base64.b64encode(image_bytes).decode("ascii")
+        parts.append({"text": f"Photo of the {label}:"})
+        parts.append({"inline_data": {"mime_type": mime_type, "data": b64_img}})
+    prompt = (
+        "You are a master barber giving another barber a precise cutting plan before they "
+        "pick up the clippers, based on these three photos of the same customer's head "
+        "(back, side, and top/front). Be specific and decisive. Cover, as short labeled "
+        "lines (not paragraphs): "
+        "1) Top: exactly how to cut the top (length in clipper guard number or inches, "
+        "texture/point cutting notes, how much to take off). "
+        "2) Fade or not: state clearly whether this customer should get a fade at all, "
+        "given their hair type and current length — some heads shouldn't be faded. "
+        "3) Fade type: if yes, which fade (skin/bald fade, low, mid, high, taper) and "
+        "exactly where it should start relative to the back and sides photos. "
+        "4) Sides only: state explicitly whether the fade should be done on the sides only "
+        "(leaving the back blended but not faded) or should wrap all the way around the "
+        "back too. "
+        "Keep it tight and practical, like a note pinned to the mirror before the cut — "
+        "no fluff, no markdown headers, just the four points."
+    )
+    parts.append({"text": prompt})
+    contents = [{"role": "user", "parts": parts}]
+    return _call_gemini(contents)
+
+
+def style_chat_reply(history):
+    """Continues a Style-AI conversation after the initial photo
+    recommendation. `history` is a list of {"role": "user"/"model", "text":
+    str} dicts (the running conversation, oldest first). Returns
+    (ok, text_or_error_message)."""
+    contents = [{"role": h["role"], "parts": [{"text": h["text"]}]} for h in history]
+    return _call_gemini(contents)
+
+
+FULL_DAY_SLOTS = None  # every possible 30-min slot, 12:00 AM - 11:30 PM — used by
+                       # the owner's Availability picker in Settings
+
+
+def generate_time_slots(start_str="9:00 AM", end_str="9:00 PM"):
+    """Generates 30-minute slots between start_str and end_str (inclusive).
+    No longer hard-capped at 6:00 PM — the owner controls the real cutoff
+    via the Availability setting below, and it can run as late as they like."""
     slots = []
-    t = datetime.strptime("9:00 AM", "%I:%M %p")
-    end = datetime.strptime("6:00 PM", "%I:%M %p")
+    t = datetime.strptime(start_str, "%I:%M %p")
+    end = datetime.strptime(end_str, "%I:%M %p")
     while t <= end:
         slots.append(t.strftime("%I:%M %p").lstrip("0"))
         t += timedelta(minutes=30)
     return slots
 
 
-TIME_SLOTS = generate_time_slots()
+FULL_DAY_SLOTS = generate_time_slots("12:00 AM", "11:30 PM")
+
+# The owner picks the daily booking window (Settings > Availability). Falls
+# back to 9:00 AM - 9:00 PM — already later than the old fixed 6:00 PM cutoff
+# — the very first time the app runs, before the owner has set anything.
+AVAIL_START = get_setting("avail_start", "9:00 AM")
+AVAIL_END = get_setting("avail_end", "9:00 PM")
+TIME_SLOTS = generate_time_slots(AVAIL_START, AVAIL_END)
 
 # ----------------------------------------------------------------------------
 # OWNER / ADMIN LOGIN
@@ -753,7 +843,7 @@ IS_ADMIN = bool(st.session_state.user and st.session_state.user.get("is_admin"))
 IS_CUSTOMER = bool(st.session_state.user and not IS_ADMIN)
 VALID_PAGES = (
     BASE_PAGES
-    + (["Your Appointments", "Customers", "Settings"] if IS_ADMIN else [])
+    + (["Your Appointments", "Customers", "Style", "Settings"] if IS_ADMIN else [])
     + (["Style", "Settings"] if IS_CUSTOMER else [])
 )
 
@@ -1381,6 +1471,40 @@ raw_html(
         font-weight:700;
     }
 
+    /* ---------- CLICK-TO-ENLARGE LIGHTBOX (Craft section images) ---------- */
+    .lb-toggle{
+        position:absolute;
+        opacity:0;
+        pointer-events:none;
+        width:0; height:0;
+    }
+    label.style-card{
+        display:block;
+        cursor:zoom-in;
+    }
+    .lb-overlay{
+        display:none;
+        position:fixed;
+        inset:0;
+        z-index:9999;
+        background:rgba(5,5,5,0.94);
+        align-items:center;
+        justify-content:center;
+        cursor:zoom-out;
+        padding:40px;
+    }
+    .lb-overlay img{
+        max-width:min(90vw, 900px);
+        max-height:88vh;
+        object-fit:contain;
+        border:2px solid var(--gold);
+        border-radius:10px;
+        box-shadow:0 20px 60px rgba(0,0,0,0.6);
+    }
+    .lb-toggle:checked ~ .lb-overlay{
+        display:flex;
+    }
+
     /* ---------- INSTAGRAM ---------- */
     .insta-panel{
         text-align:center;
@@ -1697,15 +1821,19 @@ def render_home():
 
     style_cards = "".join(
         f"""
-        <div class="style-card">
+        <input type="checkbox" id="lb-craft-{i}" class="lb-toggle" />
+        <label for="lb-craft-{i}" class="style-card">
             <img src="{s['img']}" />
             <div class="style-label">
                 <span class="tag">{s['tag']}</span>
                 <span class="name">{s['name']}</span>
             </div>
-        </div>
+        </label>
+        <label for="lb-craft-{i}" class="lb-overlay">
+            <img src="{s['img']}" />
+        </label>
         """
-        for s in STYLE_SHOWCASE
+        for i, s in enumerate(STYLE_SHOWCASE)
     )
     raw_html(
         f"""
@@ -2483,6 +2611,39 @@ def render_settings():
     left, mid, right = st.columns([1, 2.2, 1])
     with mid:
         if user.get("is_admin"):
+            st.markdown("#### Availability")
+            st.markdown(
+                '<p style="color:#847f72; margin-top:-6px;">Set the hours customers are allowed '
+                'to book or reschedule into. They\'ll only ever see times inside this window.</p>',
+                unsafe_allow_html=True,
+            )
+            avail_a, avail_b = st.columns(2)
+            with avail_a:
+                start_idx = (
+                    FULL_DAY_SLOTS.index(AVAIL_START) if AVAIL_START in FULL_DAY_SLOTS else 0
+                )
+                new_start = st.selectbox(
+                    "Opens at", FULL_DAY_SLOTS, index=start_idx, key="avail_start_select"
+                )
+            with avail_b:
+                end_idx = (
+                    FULL_DAY_SLOTS.index(AVAIL_END) if AVAIL_END in FULL_DAY_SLOTS else len(FULL_DAY_SLOTS) - 1
+                )
+                new_end = st.selectbox(
+                    "Closes at", FULL_DAY_SLOTS, index=end_idx, key="avail_end_select"
+                )
+            if st.button("Save Availability", key="avail_save_btn"):
+                start_dt = datetime.strptime(new_start, "%I:%M %p")
+                end_dt = datetime.strptime(new_end, "%I:%M %p")
+                if end_dt <= start_dt:
+                    st.error("Closing time has to be after opening time.")
+                else:
+                    set_setting("avail_start", new_start)
+                    set_setting("avail_end", new_end)
+                    st.success(f"Booking hours updated: {new_start} - {new_end}.")
+                    st.rerun()
+
+            st.markdown("<div style='height:32px;'></div>", unsafe_allow_html=True)
             st.markdown("#### Email Notifications")
             if email_is_configured():
                 st.markdown(
@@ -2543,23 +2704,69 @@ def render_settings():
 
 
 # ----------------------------------------------------------------------------
-# STYLE PAGE (customers only) — take a photo, Gemini recommends a haircut.
+# STYLE PAGE — customers take one photo and get a haircut/fade recommendation
+# (auto-shared with Freddie); the owner gets a separate 3-photo (back/side/
+# top) cutting-plan tool. Both can keep chatting with the AI afterward.
 # ----------------------------------------------------------------------------
-def render_style():
-    user = st.session_state.user
-    if not user or user.get("is_admin"):
-        st.warning("Please log in with a customer account to use Style AI.")
+def render_style_chat():
+    """Shared AI-chat follow-up, shown under a recommendation for both
+    customers and the owner — lets them keep asking Gemini questions about
+    the cut without retaking photos."""
+    if "style_chat_history" not in st.session_state or not st.session_state.style_chat_history:
         return
 
+    st.markdown("<div style='height:22px;'></div>", unsafe_allow_html=True)
+    st.markdown("**Keep talking about it**")
+    for msg in st.session_state.style_chat_history[1:]:  # skip the initial photo turn
+        if msg["role"] == "user":
+            raw_html(
+                f"""
+                <div class="appt-card" style="background:rgba(212,175,55,0.08);">
+                    <p style="margin:0; color:#EDEAE2;">{msg['text']}</p>
+                </div>
+                """
+            )
+        else:
+            raw_html(
+                f"""
+                <div class="appt-card" style="flex-direction:column; align-items:flex-start;">
+                    <p style="margin:0; color:#EDEAE2;">{msg['text']}</p>
+                </div>
+                """
+            )
+
+    with st.form("style_chat_form", clear_on_submit=True):
+        follow_up = st.text_input("Ask a follow-up question", key="style_chat_input")
+        sent = st.form_submit_button("Send")
+    if sent and follow_up.strip():
+        st.session_state.style_chat_history.append({"role": "user", "text": follow_up.strip()})
+        with st.spinner("Thinking..."):
+            ok, reply = style_chat_reply(st.session_state.style_chat_history)
+        if ok:
+            st.session_state.style_chat_history.append({"role": "model", "text": reply})
+        else:
+            st.error(reply)
+            st.session_state.style_chat_history.pop()
+        st.rerun()
+
+
+def render_style():
+    user = st.session_state.user
+    if not user:
+        st.warning("Please log in to use Style AI.")
+        return
+
+    is_owner = bool(user.get("is_admin"))
+
     raw_html(
-        """
+        f"""
         <div class="section" style="padding-bottom:10px;">
             <div class="booking-head">
                 <div class="eyebrow" style="justify-content:center;">AI Consultation</div>
-                <h2 class="section-title">Find Your Style</h2>
+                <h2 class="section-title">{"Style — Owner Tool" if is_owner else "Find Your Style"}</h2>
                 <div class="divider" style="margin-left:auto; margin-right:auto;"></div>
                 <p class="section-sub" style="margin:14px auto 0 auto;">
-                    Snap a photo and get a fade and haircut recommendation before you sit in the chair.
+                    {"Upload three angles of a customer's head and get a precise cutting plan — top, fade or not, which fade, and whether it's sides only." if is_owner else "Snap a photo and get a fade and haircut recommendation before you sit in the chair."}
                 </p>
             </div>
         </div>
@@ -2569,55 +2776,75 @@ def render_style():
     with st.container(key="style_photo_widget"):
         left, mid, right = st.columns([1, 3.4, 1])
         with mid:
-            photo = st.camera_input("Take a photo", key="style_camera")
-            if photo is not None:
-                if st.button("Get My Recommendation", key="style_analyze_btn"):
-                    with st.spinner("Analyzing your photo..."):
-                        ok, result = analyze_style_photo(photo.getvalue(), mime_type=photo.type or "image/jpeg")
+            if is_owner:
+                st.markdown("**Back**")
+                photo_back = st.camera_input("Back of the head", key="style_camera_back")
+                st.markdown("**Side**")
+                photo_side = st.camera_input("Side of the head", key="style_camera_side")
+                st.markdown("**Top / Front**")
+                photo_top = st.camera_input("Top or front of the head", key="style_camera_top")
+
+                all_taken = photo_back is not None and photo_side is not None and photo_top is not None
+                if not all_taken:
+                    st.markdown(
+                        '<p style="color:#847f72;">Take all three photos to get a recommendation.</p>',
+                        unsafe_allow_html=True,
+                    )
+                if all_taken and st.button("Get Cutting Plan", key="style_analyze_btn_owner"):
+                    with st.spinner("Analyzing the three photos..."):
+                        photos = [
+                            (photo_back.getvalue(), photo_back.type or "image/jpeg"),
+                            (photo_side.getvalue(), photo_side.type or "image/jpeg"),
+                            (photo_top.getvalue(), photo_top.type or "image/jpeg"),
+                        ]
+                        ok, result = analyze_style_photos_owner(photos)
                     if ok:
-                        # Stash it in session state (not the database yet) — the
-                        # customer decides below whether Freddie gets to see it.
                         st.session_state.style_result_text = result
-                        st.session_state.style_result_decision = None
+                        st.session_state.style_chat_history = [{"role": "model", "text": result}]
                     else:
                         st.session_state.style_result_text = None
+                        st.session_state.pop("style_chat_history", None)
                         st.error(result)
 
-            if st.session_state.get("style_result_text"):
-                raw_html(
-                    f"""
-                    <div class="appt-card" style="flex-direction:column; align-items:flex-start; gap:10px;">
-                        <div class="appt-service">Your Recommendation</div>
-                        <p style="margin:0; color:#EDEAE2; font-size:1.08rem; line-height:1.65;">{st.session_state.style_result_text}</p>
-                    </div>
-                    """
-                )
+                if st.session_state.get("style_result_text"):
+                    raw_html(
+                        f"""
+                        <div class="appt-card" style="flex-direction:column; align-items:flex-start; gap:10px;">
+                            <div class="appt-service">Cutting Plan</div>
+                            <p style="margin:0; color:#EDEAE2; font-size:1.08rem; line-height:1.65; white-space:pre-line;">{st.session_state.style_result_text}</p>
+                        </div>
+                        """
+                    )
+                    render_style_chat()
 
-            decision = st.session_state.get("style_result_decision")
-            if decision is None:
-                st.markdown(
-                    """
-                    <p style="color:#847f72; margin:16px 0 8px 0;">
-                        Want to share this with Freddie so he knows what you're going for before your appointment?
-                    </p>
-                    """,
-                    unsafe_allow_html=True,
-                )
-                with st.container(key="style_share_buttons"):
-                    send_col, keep_col = st.columns(2)
-                    with send_col:
-                        if st.button("Send to Freddie", key="style_send_btn"):
-                            save_style_note(user["id"], st.session_state.style_result_text)
-                            st.session_state.style_result_decision = "sent"
-                            st.rerun()
-                    with keep_col:
-                        if st.button("Keep Just for Me", key="style_private_btn"):
-                            st.session_state.style_result_decision = "private"
-                            st.rerun()
-            elif decision == "sent":
-                st.success("Sent to Freddie ✓ - he'll have this before your appointment.")
             else:
-                st.info("Kept private - only you can see this.")
+                photo = st.camera_input("Take a photo", key="style_camera")
+                if photo is not None:
+                    if st.button("Get My Recommendation", key="style_analyze_btn"):
+                        with st.spinner("Analyzing your photo..."):
+                            ok, result = analyze_style_photo(photo.getvalue(), mime_type=photo.type or "image/jpeg")
+                        if ok:
+                            # Automatically shared with Freddie the moment it's
+                            # generated — no extra step for the customer.
+                            save_style_note(user["id"], result)
+                            st.session_state.style_result_text = result
+                            st.session_state.style_chat_history = [{"role": "model", "text": result}]
+                        else:
+                            st.session_state.style_result_text = None
+                            st.session_state.pop("style_chat_history", None)
+                            st.error(result)
+
+                if st.session_state.get("style_result_text"):
+                    raw_html(
+                        f"""
+                        <div class="appt-card" style="flex-direction:column; align-items:flex-start; gap:10px;">
+                            <div class="appt-service">Your Recommendation</div>
+                            <p style="margin:0; color:#EDEAE2; font-size:1.08rem; line-height:1.65;">{st.session_state.style_result_text}</p>
+                        </div>
+                        """
+                    )
+                    st.success("Sent to Freddie ✓ - he'll have this before your appointment.")
+                    render_style_chat()
 
     st.markdown("<div style='height:60px;'></div>", unsafe_allow_html=True)
 
