@@ -1311,8 +1311,8 @@ raw_html(
         align-items:stretch;
     }
     .price-card{
-        background:linear-gradient(180deg, #23262b, #15171a);
-        border:1px solid rgba(255,255,255,0.14);
+        background:linear-gradient(180deg, var(--charcoal-2), var(--charcoal));
+        border:1px solid rgba(212,175,55,0.22);
         border-radius:10px;
         overflow:hidden;
         display:flex;
@@ -1323,15 +1323,11 @@ raw_html(
     .price-card:hover{
         transform:translateY(-6px);
         box-shadow:0 22px 45px rgba(0,0,0,0.45);
-        border-color:rgba(255,255,255,0.3);
+        border-color:rgba(212,175,55,0.55);
     }
     .price-card.featured{
-        background:linear-gradient(180deg, rgba(212,175,55,0.16), #16130a 60%);
         border:1px solid rgba(212,175,55,0.75);
         box-shadow:0 0 0 1px rgba(212,175,55,0.15), 0 25px 60px rgba(212,175,55,0.12);
-    }
-    .price-card.featured:hover{
-        border-color:rgba(212,175,55,0.9);
     }
     .price-card-img{
         height:230px;
@@ -1342,10 +1338,20 @@ raw_html(
     .price-card-img::after{
         content:"";
         position:absolute; inset:0;
-        background:linear-gradient(180deg, rgba(7,7,7,0.05), #15171a 96%);
+        background:linear-gradient(180deg, rgba(7,7,7,0.05), var(--charcoal-2) 96%);
     }
-    .price-card.featured .price-card-img::after{
-        background:linear-gradient(180deg, rgba(7,7,7,0.05), #16130a 96%);
+    /* The "One service..." / "The full service..." note at the bottom of
+       each pricing card was the same gold color on both, making the two
+       cards blend together. Give the $10 card a cooler silver tag and
+       keep the $15 (featured) card's tag gold, so they read as visually
+       distinct at a glance — the Book buttons below are untouched. */
+    .price-card .price-line .gold-tag{
+        background:linear-gradient(120deg, #d7dade, #9aa1a8);
+        color:#0a0a0a !important;
+    }
+    .price-card.featured .price-line .gold-tag{
+        background:linear-gradient(120deg, var(--gold-light), var(--gold));
+        color:var(--premium-black) !important;
     }
     .badge{
         position:absolute;
