@@ -640,12 +640,39 @@ def generate_time_slots(start_str="9:00 AM", end_str="9:00 PM"):
 
 FULL_DAY_SLOTS = generate_time_slots("12:00 AM", "11:30 PM")
 
-# The owner picks the daily booking window (Settings > Availability). Falls
-# back to 9:00 AM - 9:00 PM — already later than the old fixed 6:00 PM cutoff
-# — the very first time the app runs, before the owner has set anything.
-AVAIL_START = get_setting("avail_start", "9:00 AM")
-AVAIL_END = get_setting("avail_end", "9:00 PM")
-TIME_SLOTS = generate_time_slots(AVAIL_START, AVAIL_END)
+# The owner picks hours PER DAY OF THE WEEK (Settings > Availability) — e.g.
+# open later on weekends, closed on Sundays, etc. Falls back to 9:00 AM -
+# 9:00 PM (already later than the old fixed 6:00 PM cutoff) for any day the
+# owner hasn't customized yet.
+WEEKDAYS = [
+    ("mon", "Monday"), ("tue", "Tuesday"), ("wed", "Wednesday"),
+    ("thu", "Thursday"), ("fri", "Friday"), ("sat", "Saturday"), ("sun", "Sunday"),
+]
+
+
+def get_day_hours(weekday_key):
+    """Returns (start_str, end_str, closed_bool) for one weekday key
+    ('mon'..'sun'), reading the owner's per-day Settings — or the old
+    single avail_start/avail_end as a fallback for anyone upgrading from
+    the previous single-window version, or sane defaults if neither is set."""
+    fallback_start = get_setting("avail_start", "9:00 AM")
+    fallback_end = get_setting("avail_end", "9:00 PM")
+    start = get_setting(f"avail_{weekday_key}_start", fallback_start)
+    end = get_setting(f"avail_{weekday_key}_end", fallback_end)
+    closed = get_setting(f"avail_{weekday_key}_closed", "0") == "1"
+    return start, end, closed
+
+
+def time_slots_for_date(target_date):
+    """The actual bookable 30-min slots for a specific calendar date, based
+    on whatever hours the owner set for that day of the week. Empty list
+    means the shop is closed that day."""
+    weekday_key = WEEKDAYS[target_date.weekday()][0]
+    start, end, closed = get_day_hours(weekday_key)
+    if closed:
+        return []
+    return generate_time_slots(start, end)
+
 
 # ----------------------------------------------------------------------------
 # OWNER / ADMIN LOGIN
@@ -1472,6 +1499,9 @@ raw_html(
     }
 
     /* ---------- CLICK-TO-ENLARGE LIGHTBOX (Craft section images) ---------- */
+    .craft-item{
+        display:contents;
+    }
     .lb-toggle{
         position:absolute;
         opacity:0;
@@ -1501,7 +1531,23 @@ raw_html(
         border-radius:10px;
         box-shadow:0 20px 60px rgba(0,0,0,0.6);
     }
-    .lb-toggle:checked ~ .lb-overlay{
+    .lb-close{
+        position:fixed;
+        top:18px; right:24px;
+        width:42px; height:42px;
+        border-radius:50%;
+        background:rgba(255,255,255,0.08);
+        border:1px solid rgba(212,175,55,0.5);
+        color:#F5F1E6;
+        font-size:1.6rem;
+        line-height:40px;
+        text-align:center;
+        cursor:pointer;
+    }
+    /* Scoped to each .craft-item so opening one card never lights up another
+       card's overlay — the general-sibling selector only ever sees siblings
+       within the same (display:contents) wrapper. */
+    .craft-item .lb-toggle:checked ~ .lb-overlay{
         display:flex;
     }
 
@@ -1821,17 +1867,20 @@ def render_home():
 
     style_cards = "".join(
         f"""
-        <input type="checkbox" id="lb-craft-{i}" class="lb-toggle" />
-        <label for="lb-craft-{i}" class="style-card">
-            <img src="{s['img']}" />
-            <div class="style-label">
-                <span class="tag">{s['tag']}</span>
-                <span class="name">{s['name']}</span>
-            </div>
-        </label>
-        <label for="lb-craft-{i}" class="lb-overlay">
-            <img src="{s['img']}" />
-        </label>
+        <div class="craft-item">
+            <input type="checkbox" id="lb-craft-{i}" class="lb-toggle" />
+            <label for="lb-craft-{i}" class="style-card">
+                <img src="{s['img']}" />
+                <div class="style-label">
+                    <span class="tag">{s['tag']}</span>
+                    <span class="name">{s['name']}</span>
+                </div>
+            </label>
+            <label for="lb-craft-{i}" class="lb-overlay">
+                <span class="lb-close">&times;</span>
+                <img src="{s['img']}" />
+            </label>
+        </div>
         """
         for i, s in enumerate(STYLE_SHOWCASE)
     )
@@ -2133,8 +2182,17 @@ def render_book_now():
                     )
                 with col_b:
                     booked_times = get_booked_times(appt_date.isoformat())
-                    available_times = [t for t in TIME_SLOTS if t not in booked_times]
-                    if available_times:
+                    day_slots = time_slots_for_date(appt_date)
+                    available_times = [t for t in day_slots if t not in booked_times]
+                    if not day_slots:
+                        appt_time = None
+                        st.selectbox(
+                            "Time",
+                            ["Closed that day - pick another date"],
+                            disabled=True,
+                            key="booking_time_closed",
+                        )
+                    elif available_times:
                         appt_time = st.selectbox("Time", available_times, key="booking_time")
                     else:
                         appt_time = None
@@ -2211,7 +2269,7 @@ def render_book_now():
                                     )
                                 with rc_b:
                                     booked_times = get_booked_times(new_date.isoformat(), exclude_appt_id=appt_id)
-                                    available_times = [t for t in TIME_SLOTS if t not in booked_times]
+                                    available_times = [t for t in time_slots_for_date(new_date) if t not in booked_times]
                                     if new_date.isoformat() == appt_date_str and appt_time_str not in available_times:
                                         available_times = [appt_time_str] + available_times
                                     if available_times:
@@ -2445,7 +2503,7 @@ def render_my_schedule():
                             )
                         with rc_b:
                             booked_times = get_booked_times(new_date.isoformat(), exclude_appt_id=appt_id)
-                            available_times = [t for t in TIME_SLOTS if t not in booked_times]
+                            available_times = [t for t in time_slots_for_date(new_date) if t not in booked_times]
                             if new_date.isoformat() == appt_date_str and appt_time_str not in available_times:
                                 available_times = [appt_time_str] + available_times
                             if available_times:
@@ -2614,33 +2672,55 @@ def render_settings():
             st.markdown("#### Availability")
             st.markdown(
                 '<p style="color:#847f72; margin-top:-6px;">Set the hours customers are allowed '
-                'to book or reschedule into. They\'ll only ever see times inside this window.</p>',
+                'to book or reschedule into — pick different hours for each day, or mark a day '
+                'closed entirely.</p>',
                 unsafe_allow_html=True,
             )
-            avail_a, avail_b = st.columns(2)
-            with avail_a:
-                start_idx = (
-                    FULL_DAY_SLOTS.index(AVAIL_START) if AVAIL_START in FULL_DAY_SLOTS else 0
-                )
-                new_start = st.selectbox(
-                    "Opens at", FULL_DAY_SLOTS, index=start_idx, key="avail_start_select"
-                )
-            with avail_b:
-                end_idx = (
-                    FULL_DAY_SLOTS.index(AVAIL_END) if AVAIL_END in FULL_DAY_SLOTS else len(FULL_DAY_SLOTS) - 1
-                )
-                new_end = st.selectbox(
-                    "Closes at", FULL_DAY_SLOTS, index=end_idx, key="avail_end_select"
-                )
+            day_inputs = {}
+            for wd_key, wd_label in WEEKDAYS:
+                cur_start, cur_end, cur_closed = get_day_hours(wd_key)
+                with st.container(key=f"avail_row_{wd_key}"):
+                    day_a, day_b, day_c = st.columns([1.1, 1.1, 0.8])
+                    with day_a:
+                        start_idx = FULL_DAY_SLOTS.index(cur_start) if cur_start in FULL_DAY_SLOTS else 0
+                        d_start = st.selectbox(
+                            f"{wd_label} opens",
+                            FULL_DAY_SLOTS,
+                            index=start_idx,
+                            key=f"avail_{wd_key}_start_select",
+                            disabled=cur_closed,
+                        )
+                    with day_b:
+                        end_idx = (
+                            FULL_DAY_SLOTS.index(cur_end) if cur_end in FULL_DAY_SLOTS else len(FULL_DAY_SLOTS) - 1
+                        )
+                        d_end = st.selectbox(
+                            f"{wd_label} closes",
+                            FULL_DAY_SLOTS,
+                            index=end_idx,
+                            key=f"avail_{wd_key}_end_select",
+                            disabled=cur_closed,
+                        )
+                    with day_c:
+                        st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
+                        d_closed = st.checkbox("Closed", value=cur_closed, key=f"avail_{wd_key}_closed_check")
+                day_inputs[wd_key] = (d_start, d_end, d_closed)
+
             if st.button("Save Availability", key="avail_save_btn"):
-                start_dt = datetime.strptime(new_start, "%I:%M %p")
-                end_dt = datetime.strptime(new_end, "%I:%M %p")
-                if end_dt <= start_dt:
-                    st.error("Closing time has to be after opening time.")
+                errors = []
+                for wd_key, wd_label in WEEKDAYS:
+                    d_start, d_end, d_closed = day_inputs[wd_key]
+                    if not d_closed and datetime.strptime(d_end, "%I:%M %p") <= datetime.strptime(d_start, "%I:%M %p"):
+                        errors.append(wd_label)
+                if errors:
+                    st.error(f"Closing time has to be after opening time for: {', '.join(errors)}.")
                 else:
-                    set_setting("avail_start", new_start)
-                    set_setting("avail_end", new_end)
-                    st.success(f"Booking hours updated: {new_start} - {new_end}.")
+                    for wd_key, wd_label in WEEKDAYS:
+                        d_start, d_end, d_closed = day_inputs[wd_key]
+                        set_setting(f"avail_{wd_key}_start", d_start)
+                        set_setting(f"avail_{wd_key}_end", d_end)
+                        set_setting(f"avail_{wd_key}_closed", "1" if d_closed else "0")
+                    st.success("Booking hours updated for every day.")
                     st.rerun()
 
             st.markdown("<div style='height:32px;'></div>", unsafe_allow_html=True)
@@ -2777,34 +2857,69 @@ def render_style():
         left, mid, right = st.columns([1, 3.4, 1])
         with mid:
             if is_owner:
-                st.markdown("**Back**")
-                photo_back = st.camera_input("Back of the head", key="style_camera_back")
-                st.markdown("**Side**")
-                photo_side = st.camera_input("Side of the head", key="style_camera_side")
-                st.markdown("**Top / Front**")
-                photo_top = st.camera_input("Top or front of the head", key="style_camera_top")
+                # Three separate st.camera_input widgets mounted on the page
+                # at once was the actual bug some phones hit (only the last
+                # one could ever get a live camera stream — the other two
+                # stayed stuck on the "would like to use your camera" prompt
+                # forever). Rendering exactly one camera_input at a time,
+                # one step at a time, avoids that entirely.
+                OWNER_STEPS = [
+                    ("back", "Back", "Back of the head"),
+                    ("side", "Side", "Side of the head"),
+                    ("top", "Top / Front", "Top or front of the head"),
+                ]
+                if "owner_photo_step" not in st.session_state:
+                    st.session_state.owner_photo_step = 0
+                if "owner_photos" not in st.session_state:
+                    st.session_state.owner_photos = {}
 
-                all_taken = photo_back is not None and photo_side is not None and photo_top is not None
-                if not all_taken:
-                    st.markdown(
-                        '<p style="color:#847f72;">Take all three photos to get a recommendation.</p>',
-                        unsafe_allow_html=True,
-                    )
-                if all_taken and st.button("Get Cutting Plan", key="style_analyze_btn_owner"):
-                    with st.spinner("Analyzing the three photos..."):
-                        photos = [
-                            (photo_back.getvalue(), photo_back.type or "image/jpeg"),
-                            (photo_side.getvalue(), photo_side.type or "image/jpeg"),
-                            (photo_top.getvalue(), photo_top.type or "image/jpeg"),
-                        ]
-                        ok, result = analyze_style_photos_owner(photos)
-                    if ok:
-                        st.session_state.style_result_text = result
-                        st.session_state.style_chat_history = [{"role": "model", "text": result}]
-                    else:
+                step = st.session_state.owner_photo_step
+
+                for i, (pkey, plabel, _) in enumerate(OWNER_STEPS[:step]):
+                    data = st.session_state.owner_photos.get(pkey)
+                    if data:
+                        thumb_col, info_col = st.columns([1, 3])
+                        with thumb_col:
+                            st.image(data[0], width=90)
+                        with info_col:
+                            st.markdown(f"**{plabel}** captured ✓")
+                            if st.button(f"Retake {plabel}", key=f"retake_owner_{pkey}"):
+                                st.session_state.owner_photo_step = i
+                                st.session_state.owner_photos.pop(pkey, None)
+                                st.rerun()
+
+                if step < len(OWNER_STEPS):
+                    pkey, plabel, cam_label = OWNER_STEPS[step]
+                    st.markdown(f"**{plabel}**")
+                    photo = st.camera_input(cam_label, key=f"style_camera_{pkey}")
+                    if photo is not None:
+                        if st.button("Use This Photo", key=f"confirm_owner_{pkey}"):
+                            st.session_state.owner_photos[pkey] = (photo.getvalue(), photo.type or "image/jpeg")
+                            st.session_state.owner_photo_step += 1
+                            st.rerun()
+                else:
+                    st.success("All three photos captured.")
+                    if st.button("Retake All", key="retake_all_owner"):
+                        st.session_state.owner_photo_step = 0
+                        st.session_state.owner_photos = {}
                         st.session_state.style_result_text = None
                         st.session_state.pop("style_chat_history", None)
-                        st.error(result)
+                        st.rerun()
+                    if st.button("Get Cutting Plan", key="style_analyze_btn_owner"):
+                        with st.spinner("Analyzing the three photos..."):
+                            photos = [
+                                st.session_state.owner_photos["back"],
+                                st.session_state.owner_photos["side"],
+                                st.session_state.owner_photos["top"],
+                            ]
+                            ok, result = analyze_style_photos_owner(photos)
+                        if ok:
+                            st.session_state.style_result_text = result
+                            st.session_state.style_chat_history = [{"role": "model", "text": result}]
+                        else:
+                            st.session_state.style_result_text = None
+                            st.session_state.pop("style_chat_history", None)
+                            st.error(result)
 
                 if st.session_state.get("style_result_text"):
                     raw_html(
