@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import sqlite3
 import hashlib
 import os
@@ -865,11 +866,13 @@ def notify_reschedule(name, email, service, old_date_iso, old_time, new_date_iso
 if "user" not in st.session_state:
     st.session_state.user = None
 
-BASE_PAGES = ["Home", "About Me", "Pricing", "Book Now", "Instagram"]
+BASE_PAGES = ["Home", "About Me", "Pricing", "What You Get", "Book Now"]
 IS_ADMIN = bool(st.session_state.user and st.session_state.user.get("is_admin"))
 IS_CUSTOMER = bool(st.session_state.user and not IS_ADMIN)
+AUTH_PAGES = [] if st.session_state.user else ["Log In"]
 VALID_PAGES = (
     BASE_PAGES
+    + AUTH_PAGES
     + (["Your Appointments", "Customers", "Style", "Settings"] if IS_ADMIN else [])
     + (["Style", "Settings"] if IS_CUSTOMER else [])
 )
@@ -1753,10 +1756,182 @@ raw_html(
         }
         .section{ padding:60px 20px; }
         .pillars{ grid-template-columns:1fr; }
+
+        .wyg-row{ flex-direction:column !important; }
+        .cut-picker-options{ flex-direction:column !important; }
+        .splash-title{ font-size:2.1rem !important; }
+        .splash-tagline{ font-size:0.95rem !important; }
     }
+
+    /* ---------- CAMERA (un-mirrored preview) ----------
+       st.camera_input mirrors its live preview by default (like a selfie
+       cam), which is confusing when lining up a fade or checking a part —
+       what you see should match what actually gets captured. Force the
+       live <video> feed to display un-mirrored. */
+    div[data-testid="stCameraInput"] video{
+        transform:scaleX(1) !important;
+    }
+    div[data-testid="stCameraInputWebcamComponent"] video{
+        transform:scaleX(1) !important;
+    }
+
+    /* ---------- INTRO / SPLASH SCREEN ---------- */
+    .splash-screen{
+        position:fixed;
+        inset:0;
+        z-index:99999;
+        background:var(--black);
+        display:flex;
+        flex-direction:column;
+        align-items:center;
+        justify-content:center;
+        text-align:center;
+        animation:splashFadeOut 0.6s ease forwards;
+        animation-delay:2.1s;
+    }
+    .splash-title{
+        font-family:'Playfair Display', serif;
+        font-weight:800;
+        font-size:3.2rem;
+        letter-spacing:3px;
+        color:#F5F1E6;
+        opacity:0;
+        animation:splashRise 0.7s ease forwards;
+        animation-delay:0.15s;
+    }
+    .splash-title span{ color:var(--gold); }
+    .splash-tagline{
+        margin-top:14px;
+        font-size:1.05rem;
+        font-weight:600;
+        letter-spacing:2px;
+        text-transform:uppercase;
+        color:var(--gold-light);
+        opacity:0;
+        animation:splashRise 0.7s ease forwards;
+        animation-delay:0.85s;
+    }
+    @keyframes splashRise{
+        from{ opacity:0; transform:translateY(14px); }
+        to{ opacity:1; transform:translateY(0); }
+    }
+    @keyframes splashFadeOut{
+        from{ opacity:1; visibility:visible; }
+        to{ opacity:0; visibility:hidden; pointer-events:none; }
+    }
+
+    /* ---------- FLOATING "BOOK A CUT" BUTTON (mobile-first, sticky) ---------- */
+    .st-key-floating_book_cta{
+        position:fixed;
+        left:50%;
+        bottom:18px;
+        transform:translateX(-50%);
+        z-index:9998;
+        width:auto;
+    }
+    .st-key-floating_book_cta .stButton > button{
+        padding:12px 26px !important;
+        border-radius:30px !important;
+        font-size:0.78rem !important;
+        letter-spacing:1.5px !important;
+        box-shadow:0 10px 26px rgba(212,175,55,0.45) !important;
+        white-space:nowrap;
+    }
+
+    /* ---------- WHAT YOU GET (scroll reveal) ---------- */
+    .wyg-row{
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        gap:10px;
+        flex-wrap:wrap;
+        max-width:900px;
+        margin:0 auto;
+    }
+    .wyg-item{
+        background:var(--charcoal-2);
+        border:1px solid rgba(212,175,55,0.25);
+        border-radius:10px;
+        padding:18px 26px;
+        font-family:'Playfair Display', serif;
+        font-weight:700;
+        font-size:1.2rem;
+        color:#F5F1E6;
+        letter-spacing:1px;
+        opacity:0;
+        transform:translateY(24px);
+        transition:opacity 0.55s ease, transform 0.55s ease;
+    }
+    .wyg-item.visible{
+        opacity:1;
+        transform:translateY(0);
+    }
+    .wyg-item .check{ color:var(--gold); margin-left:8px; }
+    .wyg-arrow{
+        color:var(--gold);
+        font-size:1.4rem;
+        opacity:0;
+        transition:opacity 0.4s ease;
+    }
+    .wyg-arrow.visible{ opacity:1; }
+
+    /* ---------- CHOOSE YOUR CUT (interactive picker) ---------- */
+    .cut-picker-wrap{
+        max-width:760px;
+        margin:50px auto 0 auto;
+        background:linear-gradient(180deg, var(--charcoal-2), var(--charcoal));
+        border:1px solid rgba(212,175,55,0.25);
+        border-radius:14px;
+        padding:36px 32px;
+    }
+    .cut-picker-head{ text-align:center; margin-bottom:22px; }
+    .cut-picker-head h3{ font-size:1.5rem; margin:0 0 6px 0; }
+    .st-key-cut_picker_radio .stRadio > div{
+        display:flex;
+        gap:12px;
+        flex-wrap:wrap;
+        justify-content:center;
+    }
+    .st-key-cut_picker_radio label{
+        background:var(--charcoal-3);
+        border:1px solid rgba(212,175,55,0.3);
+        border-radius:30px;
+        padding:10px 22px !important;
+        margin:0 !important;
+    }
+    .cut-result{
+        margin-top:26px;
+        text-align:center;
+        padding:22px;
+        border-top:1px solid rgba(212,175,55,0.2);
+    }
+    .cut-result-price{
+        font-family:'Playfair Display', serif;
+        font-size:2.4rem;
+        font-weight:700;
+        color:#F7F3E7;
+    }
+    .cut-result-meta{ margin:10px 0 16px 0; }
     </style>
     """.replace("__IMG_HERO__", IMG_HERO)
 )
+
+# ----------------------------------------------------------------------------
+# INTRO / SPLASH SCREEN
+# ----------------------------------------------------------------------------
+# Shown once per browser session (not on every rerun/click) — briefly
+# flashes the wordmark + tagline, then fades away on its own via CSS so the
+# rest of the site can render underneath it the whole time.
+if "splash_shown" not in st.session_state:
+    st.session_state.splash_shown = True
+    raw_html(
+        """
+        <div class="splash-screen">
+            <div class="splash-title">FADED<span>FOR</span>LESS</div>
+            <div class="splash-tagline">Cuts without the crazy price.</div>
+        </div>
+        """
+    )
 
 # ----------------------------------------------------------------------------
 # NAVBAR
@@ -1836,6 +2011,16 @@ with st.container(key="site_navbar"):
                     type="primary" if is_active else "secondary",
                     use_container_width=True,
                 )
+
+# ----------------------------------------------------------------------------
+# FLOATING "BOOK A CUT" BUTTON
+# ----------------------------------------------------------------------------
+# Small gold pill fixed near the bottom of the screen, visible while
+# scrolling on any device (styled small/sticky for phone in the CSS above).
+# Hidden on the Book Now page itself, since it's redundant there.
+if current_page != "Book Now":
+    with st.container(key="floating_book_cta"):
+        st.button("Book a Cut", key="floating_book_cta_btn", type="primary", on_click=go_to, args=("Book Now",))
 
 # ----------------------------------------------------------------------------
 # HOME PAGE
@@ -2046,6 +2231,261 @@ def render_pricing():
 
     st.markdown("<div style='height:20px;'></div>", unsafe_allow_html=True)
 
+    # ---------- CHOOSE YOUR CUT (interactive, sits under the two cards above) ----------
+    raw_html(
+        """
+        <div class="cut-picker-wrap">
+            <div class="cut-picker-head">
+                <div class="eyebrow" style="justify-content:center;">Not Sure Yet?</div>
+                <h3>Choose Your Cut</h3>
+                <p class="section-sub" style="margin:0 auto;">Pick what you want done and see the price, time, and what's included.</p>
+            </div>
+        </div>
+        """
+    )
+
+    CUT_OPTIONS = {
+        "Fade": {
+            "service_key": "Fade or Trim - $10 (30 min)",
+            "price": "$10",
+            "time": "30 min",
+            "includes": ["Clean, blended fade"],
+        },
+        "Trim": {
+            "service_key": "Fade or Trim - $10 (30 min)",
+            "price": "$10",
+            "time": "30 min",
+            "includes": ["Neat, tidy trim"],
+        },
+        "Full Haircut": {
+            "service_key": "Full Haircut - $15 (1 hour)",
+            "price": "$15",
+            "time": "1 hour",
+            "includes": ["Fade", "Trim", "Cleanup", "Finished look"],
+        },
+    }
+
+    outer_l2, outer_mid2, outer_r2 = st.columns([1, 5.4, 1])
+    with outer_mid2:
+        with st.container(key="cut_picker_radio"):
+            choice = st.radio(
+                "Choose your cut",
+                list(CUT_OPTIONS.keys()),
+                key="cut_picker_choice",
+                horizontal=True,
+                label_visibility="collapsed",
+            )
+        picked = CUT_OPTIONS[choice]
+        chips = "".join(f'<span class="chip">{item}</span>' for item in picked["includes"])
+        raw_html(
+            f"""
+            <div class="cut-result">
+                <div class="cut-result-price">{picked['price']}</div>
+                <div class="cut-result-meta"><span class="chip">{picked['time']}</span></div>
+                <div class="price-meta" style="justify-content:center;">{chips}</div>
+            </div>
+            """
+        )
+        st.button(
+            f"Book {choice} - {picked['price']} →",
+            key="cut_picker_book_btn",
+            type="primary",
+            use_container_width=True,
+            on_click=go_to_service,
+            args=("Book Now", picked["service_key"]),
+        )
+
+    st.markdown("<div style='height:20px;'></div>", unsafe_allow_html=True)
+
+# ----------------------------------------------------------------------------
+# WHAT YOU GET PAGE
+# ----------------------------------------------------------------------------
+def render_what_you_get():
+    raw_html(
+        """
+        <div class="section" style="padding-bottom:10px;">
+            <div class="booking-head">
+                <div class="eyebrow" style="justify-content:center;">What You Get</div>
+                <h2 class="section-title">The $15 Full Haircut, step by step</h2>
+                <div class="divider" style="margin-left:auto; margin-right:auto;"></div>
+                <p class="section-sub" style="margin:14px auto 0 auto;">
+                    Scroll down to see exactly what's included - no shortcuts, no upsells.
+                </p>
+            </div>
+        </div>
+        """
+    )
+
+    # Spacer so the checklist starts below the fold - gives the scroll
+    # reveal something to actually trigger on, on both phone and desktop.
+    st.markdown("<div style='height:38vh;'></div>", unsafe_allow_html=True)
+
+    raw_html(
+        """
+        <div class="section section-tight" style="padding-top:0;">
+            <div class="wyg-row" id="wyg-row">
+                <div class="wyg-item" data-wyg="0">FADE <span class="check">✓</span></div>
+                <div class="wyg-arrow" data-wyg-arrow="0">→</div>
+                <div class="wyg-item" data-wyg="1">TRIM <span class="check">✓</span></div>
+                <div class="wyg-arrow" data-wyg-arrow="1">→</div>
+                <div class="wyg-item" data-wyg="2">CLEANUP <span class="check">✓</span></div>
+                <div class="wyg-arrow" data-wyg-arrow="2">→</div>
+                <div class="wyg-item" data-wyg="3">FINISHED <span class="check">✓</span></div>
+            </div>
+        </div>
+        """
+    )
+
+    # Scroll-triggered reveal: this small iframe's JS reaches out to the
+    # *parent* document (same-origin, so this is safe) and watches the
+    # .wyg-item row with an IntersectionObserver. When it scrolls into
+    # view, each item (and the arrow before it) lights up one at a time.
+    components.html(
+        """
+        <script>
+        (function() {
+            const doc = window.parent.document;
+            const row = doc.getElementById('wyg-row');
+            if (!row || row.dataset.wygBound) return;
+            row.dataset.wygBound = "1";
+
+            const items = Array.from(row.querySelectorAll('[data-wyg]'));
+            const arrows = Array.from(row.querySelectorAll('[data-wyg-arrow]'));
+
+            function reveal() {
+                items.forEach((el, i) => {
+                    setTimeout(() => el.classList.add('visible'), i * 450);
+                });
+                arrows.forEach((el, i) => {
+                    setTimeout(() => el.classList.add('visible'), i * 450 + 220);
+                });
+            }
+
+            const observer = new IntersectionObserver((entries) => {
+                entries.forEach((entry) => {
+                    if (entry.isIntersecting) {
+                        reveal();
+                        observer.disconnect();
+                    }
+                });
+            }, { threshold: 0.4, root: null });
+
+            observer.observe(row);
+        })();
+        </script>
+        """,
+        height=0,
+    )
+
+    st.markdown("<div style='height:20vh;'></div>", unsafe_allow_html=True)
+
+    with st.container(key="wyg_cta"):
+        c1, c2, _sp = st.columns([1, 1, 3])
+        with c1:
+            st.button("Book the $15 Cut", key="wyg_book_now", type="primary", on_click=go_to, args=("Book Now",))
+        with c2:
+            st.button("See Full Pricing", key="wyg_view_pricing", on_click=go_to, args=("Pricing",))
+
+    st.markdown("<div style='height:60px;'></div>", unsafe_allow_html=True)
+
+
+def render_login():
+    if st.session_state.user:
+        st.success("You're already logged in.")
+        return
+
+    raw_html(
+        """
+        <div class="section" style="padding-bottom:20px;">
+            <div class="booking-head">
+                <div class="eyebrow" style="justify-content:center;">Account</div>
+                <h2 class="section-title">Log In or Sign Up</h2>
+                <div class="divider" style="margin-left:auto; margin-right:auto;"></div>
+                <p class="section-sub" style="margin:14px auto 0 auto;">
+                    Create a free account to book - it keeps your appointment history in one place
+                    and makes rebooking quick.
+                </p>
+            </div>
+        </div>
+        """
+    )
+
+    left, mid, right = st.columns([1, 2.2, 1])
+    with mid:
+        with st.container(key="auth_tabs"):
+            tab_login, tab_signup = st.tabs(["Log In", "Sign Up"])
+
+            with tab_login:
+                with st.form("login_form"):
+                    email = st.text_input("Email", key="login_email")
+                    password = st.text_input("Password", type="password", key="login_password")
+                    submitted = st.form_submit_button("Log In")
+                    if submitted:
+                        if not email or not password:
+                            st.error("Please enter your email and password.")
+                        elif email.strip().lower() == ADMIN_EMAIL.lower() and password == ADMIN_PASSWORD:
+                            st.session_state.user = {
+                                "id": None,
+                                "name": "Freddie",
+                                "email": ADMIN_EMAIL,
+                                "phone": None,
+                                "is_admin": True,
+                            }
+                            st.success("Welcome back, Freddie!")
+                            st.query_params["page"] = "Your Appointments"
+                            st.rerun()
+                        else:
+                            user = verify_login(email, password)
+                            if user:
+                                user["is_admin"] = False
+                                st.session_state.user = user
+                                st.success(f"Welcome back, {user['name']}!")
+                                st.query_params["page"] = "Book Now"
+                                st.rerun()
+                            else:
+                                st.error("Incorrect email or password.")
+
+            with tab_signup:
+                with st.form("signup_form"):
+                    name = st.text_input("Full Name")
+                    email = st.text_input("Email *", key="signup_email")
+                    phone = st.text_input("Phone Number *", placeholder="e.g. (555) 123-4567")
+                    password = st.text_input("Password", type="password", key="signup_password")
+                    confirm = st.text_input("Confirm Password", type="password")
+                    submitted = st.form_submit_button("Create Account")
+                    if submitted:
+                        if not name or not email or not phone or not password:
+                            st.error("Name, email, phone number, and password are all required.")
+                        elif not EMAIL_RE.match(email):
+                            st.error("Please enter a valid email address.")
+                        elif not PHONE_RE.match(phone):
+                            st.error("Please enter a valid phone number.")
+                        elif len(password) < 6:
+                            st.error("Password must be at least 6 characters.")
+                        elif password != confirm:
+                            st.error("Passwords do not match.")
+                        elif email.strip().lower() == ADMIN_EMAIL.lower():
+                            st.error("This email is reserved. Please use a different one.")
+                        else:
+                            ok, msg = create_user(name, email, phone, password)
+                            if ok:
+                                user = verify_login(email, password)
+                                user["is_admin"] = False
+                                st.session_state.user = user
+                                st.success(
+                                    "Account created! You're now signed in. "
+                                    "Check your inbox for a welcome email - if it's not there, "
+                                    "look in Spam/Junk and mark it 'Not Spam' so future booking "
+                                    "confirmations land in your inbox."
+                                )
+                                st.query_params["page"] = "Book Now"
+                                st.rerun()
+                            else:
+                                st.error(msg)
+
+    st.markdown("<div style='height:60px;'></div>", unsafe_allow_html=True)
+
+
 # ----------------------------------------------------------------------------
 # BOOK NOW PAGE (account creation, login, appointment booking)
 # ----------------------------------------------------------------------------
@@ -2070,74 +2510,25 @@ def render_book_now():
 
     with mid:
         if not st.session_state.user:
-            with st.container(key="auth_tabs"):
-                tab_login, tab_signup = st.tabs(["Log In", "Sign Up"])
-
-                with tab_login:
-                    with st.form("login_form"):
-                        email = st.text_input("Email", key="login_email")
-                        password = st.text_input("Password", type="password", key="login_password")
-                        submitted = st.form_submit_button("Log In")
-                        if submitted:
-                            if not email or not password:
-                                st.error("Please enter your email and password.")
-                            elif email.strip().lower() == ADMIN_EMAIL.lower() and password == ADMIN_PASSWORD:
-                                st.session_state.user = {
-                                    "id": None,
-                                    "name": "Freddie",
-                                    "email": ADMIN_EMAIL,
-                                    "phone": None,
-                                    "is_admin": True,
-                                }
-                                st.success("Welcome back, Freddie!")
-                                st.query_params["page"] = "Your Appointments"
-                                st.rerun()
-                            else:
-                                user = verify_login(email, password)
-                                if user:
-                                    user["is_admin"] = False
-                                    st.session_state.user = user
-                                    st.success(f"Welcome back, {user['name']}!")
-                                    st.rerun()
-                                else:
-                                    st.error("Incorrect email or password.")
-
-                with tab_signup:
-                    with st.form("signup_form"):
-                        name = st.text_input("Full Name")
-                        email = st.text_input("Email *", key="signup_email")
-                        phone = st.text_input("Phone Number *", placeholder="e.g. (555) 123-4567")
-                        password = st.text_input("Password", type="password", key="signup_password")
-                        confirm = st.text_input("Confirm Password", type="password")
-                        submitted = st.form_submit_button("Create Account")
-                        if submitted:
-                            if not name or not email or not phone or not password:
-                                st.error("Name, email, phone number, and password are all required.")
-                            elif not EMAIL_RE.match(email):
-                                st.error("Please enter a valid email address.")
-                            elif not PHONE_RE.match(phone):
-                                st.error("Please enter a valid phone number.")
-                            elif len(password) < 6:
-                                st.error("Password must be at least 6 characters.")
-                            elif password != confirm:
-                                st.error("Passwords do not match.")
-                            elif email.strip().lower() == ADMIN_EMAIL.lower():
-                                st.error("This email is reserved. Please use a different one.")
-                            else:
-                                ok, msg = create_user(name, email, phone, password)
-                                if ok:
-                                    user = verify_login(email, password)
-                                    user["is_admin"] = False
-                                    st.session_state.user = user
-                                    st.success(
-                                        "Account created! You're now signed in. "
-                                        "Check your inbox for a welcome email - if it's not there, "
-                                        "look in Spam/Junk and mark it 'Not Spam' so future booking "
-                                        "confirmations land in your inbox."
-                                    )
-                                    st.rerun()
-                                else:
-                                    st.error(msg)
+            raw_html(
+                """
+                <div class="appt-card" style="flex-direction:column; align-items:center; text-align:center; gap:6px; padding:36px 24px;">
+                    <div class="appt-service">You'll need an account to book</div>
+                    <p style="margin:6px 0 4px 0; color:#847f72;">
+                        It's free and only takes a minute — it also keeps your appointment
+                        history in one place and makes rebooking quick.
+                    </p>
+                </div>
+                """
+            )
+            st.button(
+                "Log In / Sign Up →",
+                key="book_now_go_login",
+                type="primary",
+                use_container_width=True,
+                on_click=go_to,
+                args=("Log In",),
+            )
 
         elif st.session_state.user.get("is_admin"):
             user = st.session_state.user
@@ -2666,6 +3057,9 @@ def render_settings():
         """
     )
 
+    if st.session_state.pop("avail_just_saved", False):
+        st.success("Availability saved ✓")
+
     left, mid, right = st.columns([1, 2.2, 1])
     with mid:
         if user.get("is_admin"):
@@ -2720,7 +3114,7 @@ def render_settings():
                         set_setting(f"avail_{wd_key}_start", d_start)
                         set_setting(f"avail_{wd_key}_end", d_end)
                         set_setting(f"avail_{wd_key}_closed", "1" if d_closed else "0")
-                    st.success("Booking hours updated for every day.")
+                    st.session_state.avail_just_saved = True
                     st.rerun()
 
             st.markdown("<div style='height:32px;'></div>", unsafe_allow_html=True)
@@ -2830,6 +3224,31 @@ def render_style_chat():
         st.rerun()
 
 
+def photo_input_widget(key_prefix, cam_label):
+    """Lets the customer or owner either take a live photo or upload one
+    already saved on their device. Returns (image_bytes, mime_type) or None
+    if nothing has been captured/chosen yet."""
+    mode = st.radio(
+        "Photo source",
+        ["Take Photo", "Upload Photo"],
+        key=f"{key_prefix}_mode",
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+    if mode == "Take Photo":
+        photo = st.camera_input(cam_label, key=f"{key_prefix}_camera")
+        if photo is not None:
+            return photo.getvalue(), photo.type or "image/jpeg"
+        return None
+    else:
+        uploaded = st.file_uploader(cam_label, type=["png", "jpg", "jpeg"], key=f"{key_prefix}_upload")
+        if uploaded is not None:
+            ext = uploaded.name.rsplit(".", 1)[-1].lower()
+            mime = "image/png" if ext == "png" else "image/jpeg"
+            return uploaded.getvalue(), mime
+        return None
+
+
 def render_style():
     user = st.session_state.user
     if not user:
@@ -2891,10 +3310,10 @@ def render_style():
                 if step < len(OWNER_STEPS):
                     pkey, plabel, cam_label = OWNER_STEPS[step]
                     st.markdown(f"**{plabel}**")
-                    photo = st.camera_input(cam_label, key=f"style_camera_{pkey}")
-                    if photo is not None:
+                    photo_data = photo_input_widget(f"style_photo_{pkey}", cam_label)
+                    if photo_data is not None:
                         if st.button("Use This Photo", key=f"confirm_owner_{pkey}"):
-                            st.session_state.owner_photos[pkey] = (photo.getvalue(), photo.type or "image/jpeg")
+                            st.session_state.owner_photos[pkey] = photo_data
                             st.session_state.owner_photo_step += 1
                             st.rerun()
                 else:
@@ -2933,11 +3352,11 @@ def render_style():
                     render_style_chat()
 
             else:
-                photo = st.camera_input("Take a photo", key="style_camera")
-                if photo is not None:
+                photo_data = photo_input_widget("style_photo_customer", "Take a photo")
+                if photo_data is not None:
                     if st.button("Get My Recommendation", key="style_analyze_btn"):
                         with st.spinner("Analyzing your photo..."):
-                            ok, result = analyze_style_photo(photo.getvalue(), mime_type=photo.type or "image/jpeg")
+                            ok, result = analyze_style_photo(photo_data[0], mime_type=photo_data[1])
                         if ok:
                             # Automatically shared with Freddie the moment it's
                             # generated — no extra step for the customer.
@@ -2973,10 +3392,12 @@ elif current_page == "About Me":
     render_about()
 elif current_page == "Pricing":
     render_pricing()
+elif current_page == "What You Get":
+    render_what_you_get()
 elif current_page == "Book Now":
     render_book_now()
-elif current_page == "Instagram":
-    render_instagram()
+elif current_page == "Log In":
+    render_login()
 elif current_page == "Your Appointments":
     render_my_schedule()
 elif current_page == "Customers":
