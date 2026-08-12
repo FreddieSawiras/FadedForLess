@@ -1311,8 +1311,8 @@ raw_html(
         align-items:stretch;
     }
     .price-card{
-        background:linear-gradient(180deg, var(--charcoal-2), var(--charcoal));
-        border:1px solid rgba(212,175,55,0.22);
+        background:linear-gradient(180deg, #23262b, #15171a);
+        border:1px solid rgba(255,255,255,0.14);
         border-radius:10px;
         overflow:hidden;
         display:flex;
@@ -1323,11 +1323,15 @@ raw_html(
     .price-card:hover{
         transform:translateY(-6px);
         box-shadow:0 22px 45px rgba(0,0,0,0.45);
-        border-color:rgba(212,175,55,0.55);
+        border-color:rgba(255,255,255,0.3);
     }
     .price-card.featured{
+        background:linear-gradient(180deg, rgba(212,175,55,0.16), #16130a 60%);
         border:1px solid rgba(212,175,55,0.75);
         box-shadow:0 0 0 1px rgba(212,175,55,0.15), 0 25px 60px rgba(212,175,55,0.12);
+    }
+    .price-card.featured:hover{
+        border-color:rgba(212,175,55,0.9);
     }
     .price-card-img{
         height:230px;
@@ -1338,7 +1342,10 @@ raw_html(
     .price-card-img::after{
         content:"";
         position:absolute; inset:0;
-        background:linear-gradient(180deg, rgba(7,7,7,0.05), var(--charcoal-2) 96%);
+        background:linear-gradient(180deg, rgba(7,7,7,0.05), #15171a 96%);
+    }
+    .price-card.featured .price-card-img::after{
+        background:linear-gradient(180deg, rgba(7,7,7,0.05), #16130a 96%);
     }
     .badge{
         position:absolute;
@@ -1709,6 +1716,16 @@ raw_html(
         .price-grid{ grid-template-columns:1fr; }
         .strip{ grid-template-columns:1fr; }
 
+        /* On desktop the CTA row is deliberately pulled up (negative
+           margin) so it overlaps the bottom of the hero image. On phone
+           the hero is shorter, so that same overlap dragged the row up
+           into the hero's border-bottom line — the gold hairline was
+           cutting straight through "View Pricing". Let it sit naturally
+           below the hero instead. */
+        .st-key-hero_cta{
+            margin-top:28px !important;
+        }
+
         /* Show the hamburger toggle only on phone-width screens, and let
            the logo / toggle / account badge wrap onto their own line if
            they don't all fit side by side. */
@@ -1757,7 +1774,9 @@ raw_html(
         .section{ padding:60px 20px; }
         .pillars{ grid-template-columns:1fr; }
 
-        .wyg-row{ flex-direction:column !important; }
+        .wyg-step{ flex-direction:column !important; }
+        .wyg-step-img{ width:100% !important; height:180px; }
+        .wyg-step-body{ padding:18px 22px 22px 22px; }
         .cut-picker-options{ flex-direction:column !important; }
         .splash-title{ font-size:2.1rem !important; }
         .splash-tagline{ font-size:0.95rem !important; }
@@ -1838,42 +1857,58 @@ raw_html(
         white-space:nowrap;
     }
 
-    /* ---------- WHAT YOU GET (scroll reveal) ---------- */
-    .wyg-row{
+    /* ---------- WHAT YOU GET (image step cards, scroll reveal) ---------- */
+    .wyg-steps{
         display:flex;
-        align-items:center;
-        justify-content:center;
-        gap:10px;
-        flex-wrap:wrap;
-        max-width:900px;
+        flex-direction:column;
+        gap:26px;
+        max-width:760px;
         margin:0 auto;
     }
-    .wyg-item{
+    .wyg-step{
+        display:flex;
+        align-items:stretch;
+        gap:0;
         background:var(--charcoal-2);
-        border:1px solid rgba(212,175,55,0.25);
-        border-radius:10px;
-        padding:18px 26px;
-        font-family:'Playfair Display', serif;
-        font-weight:700;
-        font-size:1.2rem;
-        color:#F5F1E6;
-        letter-spacing:1px;
+        border:1px solid rgba(212,175,55,0.22);
+        border-radius:14px;
+        overflow:hidden;
         opacity:0;
-        transform:translateY(24px);
-        transition:opacity 0.55s ease, transform 0.55s ease;
+        transform:translateY(30px);
+        transition:opacity 0.6s ease, transform 0.6s ease;
     }
-    .wyg-item.visible{
+    .wyg-step.visible{
         opacity:1;
         transform:translateY(0);
     }
-    .wyg-item .check{ color:var(--gold); margin-left:8px; }
-    .wyg-arrow{
-        color:var(--gold);
-        font-size:1.4rem;
-        opacity:0;
-        transition:opacity 0.4s ease;
+    .wyg-step-img{
+        width:170px;
+        flex-shrink:0;
+        background-size:cover;
+        background-position:center;
     }
-    .wyg-arrow.visible{ opacity:1; }
+    .wyg-step-body{
+        padding:20px 26px;
+        display:flex;
+        flex-direction:column;
+        justify-content:center;
+    }
+    .wyg-step-num{
+        font-size:0.72rem;
+        letter-spacing:2px;
+        text-transform:uppercase;
+        color:var(--gold);
+        font-weight:700;
+        margin-bottom:6px;
+    }
+    .wyg-step-title{
+        font-family:'Playfair Display', serif;
+        font-size:1.5rem;
+        color:#F5F1E6;
+        margin-bottom:6px;
+    }
+    .wyg-step-title .check{ color:var(--gold); margin-left:8px; }
+    .wyg-step-desc{ font-size:0.95rem; margin:0; }
 
     /* ---------- CHOOSE YOUR CUT (interactive picker) ---------- */
     .cut-picker-wrap{
@@ -1998,13 +2033,14 @@ with st.container(key="site_navbar"):
     # pressed, in which case they stack into a vertical dropdown.
     n_pages = len(VALID_PAGES)
     links_key = "nav_links_open" if st.session_state.mobile_menu_open else "nav_links_closed"
+    NAV_LABELS = {"Your Appointments": "Your Appts", "Style": "AI Consult"}
     with st.container(key=links_key):
         link_cols = st.columns([1] * n_pages, vertical_alignment="center")
         for i, page_name in enumerate(VALID_PAGES):
             with link_cols[i]:
                 is_active = current_page == page_name
                 st.button(
-                    "Your Appts" if page_name == "Your Appointments" else page_name,
+                    NAV_LABELS.get(page_name, page_name),
                     key=f"navbtn_{page_name}",
                     on_click=go_to,
                     args=(page_name,),
@@ -2309,75 +2345,98 @@ def render_what_you_get():
                 <h2 class="section-title">The $15 Full Haircut, step by step</h2>
                 <div class="divider" style="margin-left:auto; margin-right:auto;"></div>
                 <p class="section-sub" style="margin:14px auto 0 auto;">
-                    Scroll down to see exactly what's included - no shortcuts, no upsells.
+                    Scroll down to see exactly what's included in every full haircut -
+                    no shortcuts, no upsells.
                 </p>
             </div>
         </div>
         """
     )
 
-    # Spacer so the checklist starts below the fold - gives the scroll
-    # reveal something to actually trigger on, on both phone and desktop.
-    st.markdown("<div style='height:38vh;'></div>", unsafe_allow_html=True)
+    WYG_STEPS = [
+        {
+            "num": "Step 1",
+            "title": "Fade",
+            "img": STYLE_SHOWCASE[0]["img"],
+            "desc": "A clean, blended fade built around your hair type and face shape - "
+                    "low, mid, or high, whatever suits you best.",
+        },
+        {
+            "num": "Step 2",
+            "title": "Trim",
+            "img": IMG_STRIP_2,
+            "desc": "The top gets shaped and trimmed to length, keeping everything even "
+                    "and blending seamlessly into the fade underneath.",
+        },
+        {
+            "num": "Step 3",
+            "title": "Cleanup",
+            "img": STYLE_SHOWCASE[3]["img"],
+            "desc": "Sharp lineup around the edges, neckline, and hairline for that fresh, "
+                    "just-left-the-shop look.",
+        },
+        {
+            "num": "Step 4",
+            "title": "Finished",
+            "img": IMG_PRICE_15,
+            "desc": "A complete, polished cut - checked over and touched up before you "
+                    "leave the chair.",
+        },
+    ]
 
-    raw_html(
+    steps_html = "".join(
+        f"""
+        <div class="wyg-step">
+            <div class="wyg-step-img" style="background-image:url('{s['img']}');"></div>
+            <div class="wyg-step-body">
+                <div class="wyg-step-num">{s['num']}</div>
+                <div class="wyg-step-title">{s['title']} <span class="check">✓</span></div>
+                <p class="wyg-step-desc">{s['desc']}</p>
+            </div>
+        </div>
         """
-        <div class="section section-tight" style="padding-top:0;">
-            <div class="wyg-row" id="wyg-row">
-                <div class="wyg-item" data-wyg="0">FADE <span class="check">✓</span></div>
-                <div class="wyg-arrow" data-wyg-arrow="0">→</div>
-                <div class="wyg-item" data-wyg="1">TRIM <span class="check">✓</span></div>
-                <div class="wyg-arrow" data-wyg-arrow="1">→</div>
-                <div class="wyg-item" data-wyg="2">CLEANUP <span class="check">✓</span></div>
-                <div class="wyg-arrow" data-wyg-arrow="2">→</div>
-                <div class="wyg-item" data-wyg="3">FINISHED <span class="check">✓</span></div>
+        for s in WYG_STEPS
+    )
+    raw_html(
+        f"""
+        <div class="section section-tight" style="padding-top:10px;">
+            <div class="wyg-steps">
+                {steps_html}
             </div>
         </div>
         """
     )
 
     # Scroll-triggered reveal: this small iframe's JS reaches out to the
-    # *parent* document (same-origin, so this is safe) and watches the
-    # .wyg-item row with an IntersectionObserver. When it scrolls into
-    # view, each item (and the arrow before it) lights up one at a time.
+    # *parent* document (same-origin, so this is safe) and watches each
+    # .wyg-step card individually with an IntersectionObserver, so each one
+    # fades in right as the user scrolls to it - not all at once.
     components.html(
         """
         <script>
         (function() {
             const doc = window.parent.document;
-            const row = doc.getElementById('wyg-row');
-            if (!row || row.dataset.wygBound) return;
-            row.dataset.wygBound = "1";
-
-            const items = Array.from(row.querySelectorAll('[data-wyg]'));
-            const arrows = Array.from(row.querySelectorAll('[data-wyg-arrow]'));
-
-            function reveal() {
-                items.forEach((el, i) => {
-                    setTimeout(() => el.classList.add('visible'), i * 450);
-                });
-                arrows.forEach((el, i) => {
-                    setTimeout(() => el.classList.add('visible'), i * 450 + 220);
-                });
-            }
+            const steps = Array.from(doc.querySelectorAll('.wyg-step'));
+            if (!steps.length || steps[0].dataset.wygBound) return;
+            steps.forEach(el => { el.dataset.wygBound = "1"; });
 
             const observer = new IntersectionObserver((entries) => {
                 entries.forEach((entry) => {
                     if (entry.isIntersecting) {
-                        reveal();
-                        observer.disconnect();
+                        entry.target.classList.add('visible');
+                        observer.unobserve(entry.target);
                     }
                 });
-            }, { threshold: 0.4, root: null });
+            }, { threshold: 0.25, root: null, rootMargin: "0px 0px -60px 0px" });
 
-            observer.observe(row);
+            steps.forEach(el => observer.observe(el));
         })();
         </script>
         """,
         height=0,
     )
 
-    st.markdown("<div style='height:20vh;'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='height:20px;'></div>", unsafe_allow_html=True)
 
     with st.container(key="wyg_cta"):
         c1, c2, _sp = st.columns([1, 1, 3])
@@ -3261,8 +3320,8 @@ def render_style():
         f"""
         <div class="section" style="padding-bottom:10px;">
             <div class="booking-head">
-                <div class="eyebrow" style="justify-content:center;">AI Consultation</div>
-                <h2 class="section-title">{"Style — Owner Tool" if is_owner else "Find Your Style"}</h2>
+                <div class="eyebrow" style="justify-content:center;">Virtual AI Consultation</div>
+                <h2 class="section-title">{"Virtual AI Consultation — Owner Tool" if is_owner else "Your Virtual AI Consultation"}</h2>
                 <div class="divider" style="margin-left:auto; margin-right:auto;"></div>
                 <p class="section-sub" style="margin:14px auto 0 auto;">
                     {"Upload three angles of a customer's head and get a precise cutting plan — top, fade or not, which fade, and whether it's sides only." if is_owner else "Snap a photo and get a fade and haircut recommendation before you sit in the chair."}
