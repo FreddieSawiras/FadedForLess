@@ -152,7 +152,13 @@ def check_turso_status():
         return False, f"Could NOT reach Turso: {e}"
 
 
+@st.cache_resource
 def init_db():
+    """Cached with @st.cache_resource so this only actually runs ONCE for
+    the whole app (not once per click). Without this, every button press
+    re-ran all 6 CREATE/ALTER TABLE statements as fresh network round-trips
+    to Turso before the page even started rendering — that was the single
+    biggest source of lag after moving off local SQLite."""
     conn = get_conn()
     conn.execute(
         """
@@ -476,10 +482,22 @@ def get_style_notes(user_id):
     return rows
 
 
-def get_setting(key, default=None):
+@st.cache_data(ttl=30)
+def _get_all_settings_cached():
+    """All settings in ONE network round-trip, cached for 30 seconds.
+    get_setting() used to cost its own Turso round-trip every single call —
+    and get_day_hours() calls it 3x per weekday, so just rendering the
+    Availability section made 21 separate network requests. This fetches
+    everything at once and reuses it. Cleared instantly on any write via
+    set_setting(), so the owner's changes still show up right away."""
     conn = get_conn()
-    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
-    return row[0] if row else default
+    rows = conn.execute("SELECT key, value FROM settings").fetchall()
+    return dict(rows)
+
+
+def get_setting(key, default=None):
+    settings = _get_all_settings_cached()
+    return settings.get(key, default)
 
 
 def set_setting(key, value):
@@ -490,6 +508,7 @@ def set_setting(key, value):
         (key, value),
     )
     conn.commit()
+    _get_all_settings_cached.clear()
 
 
 def get_customer_stats():
