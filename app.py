@@ -1,6 +1,6 @@
 import streamlit as st
 import streamlit.components.v1 as components
-import sqlite3
+import libsql
 import hashlib
 import os
 import re
@@ -91,16 +91,65 @@ SERVICES = {
     "Full Haircut - $15 (1 hour)": {"label": "Full Haircut (Fade + Trim)", "price": "$15", "duration": "1 hour"},
 }
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fadedforless.db")
-
 # ----------------------------------------------------------------------------
 # DATABASE
 # ----------------------------------------------------------------------------
+# Data now lives in Turso (a hosted, persistent libSQL/SQLite-compatible
+# database) instead of a local file — Streamlit Cloud wipes local files on
+# every sleep/restart, which used to wipe every account, booking, and Style
+# AI note along with it. Turso survives restarts since it's not part of the
+# app's own filesystem.
+#
+# Reads the two secrets set in Settings > Secrets (or a local
+# .streamlit/secrets.toml when running on your own machine):
+#   TURSO_DATABASE_URL   e.g. libsql://your-db-name-yourorg.turso.io
+#   TURSO_AUTH_TOKEN     the long token generated alongside it
+def get_db_secret(key):
+    val = os.environ.get(key, "")
+    if val:
+        return val
+    try:
+        return st.secrets.get(key, "")
+    except Exception:
+        return ""
+
+
 @st.cache_resource
 def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("PRAGMA foreign_keys = ON;")
+    database_url = get_db_secret("TURSO_DATABASE_URL")
+    auth_token = get_db_secret("TURSO_AUTH_TOKEN")
+    if not database_url or not auth_token:
+        st.error(
+            "Database isn't configured: TURSO_DATABASE_URL and/or TURSO_AUTH_TOKEN "
+            "are missing from Secrets. Add them in Settings > Secrets, then reload."
+        )
+        st.stop()
+    conn = libsql.connect(database=database_url, auth_token=auth_token)
     return conn
+
+
+def check_turso_status():
+    """Round-trip test — actually writes a value to the settings table and
+    reads it back, rather than just checking that get_conn() didn't error.
+    That way a stale/cached connection object can't report 'connected' when
+    writes are silently failing. Returns (ok, message)."""
+    try:
+        conn = get_conn()
+        test_value = datetime.now().isoformat()
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            ("_turso_healthcheck", test_value),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = ?", ("_turso_healthcheck",)
+        ).fetchone()
+        if row and row[0] == test_value:
+            return True, f"Connected to Turso — data is saving correctly. (checked {test_value})"
+        return False, "Connected, but the write didn't read back correctly — something's off."
+    except Exception as e:
+        return False, f"Could NOT reach Turso: {e}"
 
 
 def init_db():
@@ -124,8 +173,11 @@ def init_db():
     try:
         conn.execute("ALTER TABLE users ADD COLUMN profile_pic TEXT")
         conn.commit()
-    except sqlite3.OperationalError:
-        pass  # column already there
+    except Exception as e:
+        # Column already there — Turso/libsql doesn't necessarily raise the
+        # same exception class sqlite3 does, so match on the message instead.
+        if "duplicate column" not in str(e).lower():
+            raise
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS appointments (
@@ -148,8 +200,9 @@ def init_db():
     try:
         conn.execute("ALTER TABLE appointments ADD COLUMN reminder_sent INTEGER NOT NULL DEFAULT 0")
         conn.commit()
-    except sqlite3.OperationalError:
-        pass  # column already there
+    except Exception as e:
+        if "duplicate column" not in str(e).lower():
+            raise
     # Every Style-AI recommendation a customer gets, so the owner can look
     # back at what was said to each person about their hair (Customers tab).
     conn.execute(
@@ -201,8 +254,12 @@ def create_user(name, email, phone, password):
         conn.commit()
         notify_signup(name.strip(), email.strip().lower())
         return True, "Account created."
-    except sqlite3.IntegrityError:
-        return False, "An account with this email already exists."
+    except Exception as e:
+        # Same reasoning as the migration catches above: match on the
+        # message instead of a specific exception class.
+        if "unique" in str(e).lower() or "constraint" in str(e).lower():
+            return False, "An account with this email already exists."
+        raise
 
 
 def verify_login(email, password):
@@ -237,8 +294,10 @@ def update_profile(user_id, email, phone, profile_pic_b64=None):
             )
         conn.commit()
         return True, "Profile updated."
-    except sqlite3.IntegrityError:
-        return False, "Another account already uses that email."
+    except Exception as e:
+        if "unique" in str(e).lower() or "constraint" in str(e).lower():
+            return False, "Another account already uses that email."
+        raise
 
 
 def get_booked_times(appt_date_iso, exclude_appt_id=None):
@@ -2552,936 +2611,4 @@ def render_login():
 
 
 # ----------------------------------------------------------------------------
-# BOOK NOW PAGE (account creation, login, appointment booking)
-# ----------------------------------------------------------------------------
-def render_book_now():
-    raw_html(
-        """
-        <div class="section" style="padding-bottom:20px;">
-            <div class="booking-head">
-                <div class="eyebrow" style="justify-content:center;">Book Now</div>
-                <h2 class="section-title">Reserve your appointment</h2>
-                <div class="divider" style="margin-left:auto; margin-right:auto;"></div>
-                <p class="section-sub" style="margin:14px auto 0 auto;">
-                    Create a free account to book - it keeps your appointment history in one place
-                    and makes rebooking quick.
-                </p>
-            </div>
-        </div>
-        """
-    )
-
-    left, mid, right = st.columns([1, 2.2, 1])
-
-    with mid:
-        if not st.session_state.user:
-            raw_html(
-                """
-                <div class="appt-card" style="flex-direction:column; align-items:center; text-align:center; gap:6px; padding:36px 24px;">
-                    <div class="appt-service">You'll need an account to book</div>
-                    <p style="margin:6px 0 4px 0; color:#847f72;">
-                        It's free and only takes a minute — it also keeps your appointment
-                        history in one place and makes rebooking quick.
-                    </p>
-                </div>
-                """
-            )
-            st.button(
-                "Log In / Sign Up →",
-                key="book_now_go_login",
-                type="primary",
-                use_container_width=True,
-                on_click=go_to,
-                args=("Log In",),
-            )
-
-        elif st.session_state.user.get("is_admin"):
-            user = st.session_state.user
-            st.markdown("### Welcome back, Freddie 👋")
-            st.markdown(
-                '<p style="color:#847f72;">Booking is for customer accounts. '
-                'Head to the <b>Your Appointments</b> tab to see everyone\'s bookings on a calendar.</p>',
-                unsafe_allow_html=True,
-            )
-            if st.button("Log Out", key="logout_freddie"):
-                st.session_state.user = None
-                st.rerun()
-
-        else:
-            user = st.session_state.user
-            with st.container(key="customer_header"):
-                top_l, top_r = st.columns([3, 1])
-                with top_l:
-                    st.markdown(f"### Welcome back, {user['name']} 👋")
-                with top_r:
-                    if st.button("Log Out", key="logout_customer"):
-                        st.session_state.user = None
-                        st.rerun()
-
-            st.markdown("#### Book an Appointment")
-            # Not wrapped in st.form on purpose: the Time dropdown needs to
-            # refresh the moment the Date changes, so it only ever offers
-            # slots nobody else has already taken that day.
-            with st.container(key="booking_widget"):
-                service_options = list(SERVICES.keys())
-                preselected = st.session_state.pop("preselect_service", None)
-                default_idx = service_options.index(preselected) if preselected in service_options else 0
-                service_key = st.selectbox("Service", service_options, index=default_idx, key="booking_service")
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    appt_date = st.date_input(
-                        "Date",
-                        min_value=date.today(),
-                        max_value=date.today() + timedelta(days=60),
-                        value=date.today(),
-                        key="booking_date",
-                    )
-                with col_b:
-                    booked_times = get_booked_times(appt_date.isoformat())
-                    day_slots = time_slots_for_date(appt_date)
-                    available_times = [t for t in day_slots if t not in booked_times]
-                    if not day_slots:
-                        appt_time = None
-                        st.selectbox(
-                            "Time",
-                            ["Closed that day - pick another date"],
-                            disabled=True,
-                            key="booking_time_closed",
-                        )
-                    elif available_times:
-                        appt_time = st.selectbox("Time", available_times, key="booking_time")
-                    else:
-                        appt_time = None
-                        st.selectbox(
-                            "Time",
-                            ["Fully booked - pick another day"],
-                            disabled=True,
-                            key="booking_time_full",
-                        )
-                notes = st.text_area("Notes (optional)", placeholder="Anything the barber should know", key="booking_notes")
-                if st.button("Confirm Appointment", key="booking_confirm_btn"):
-                    if appt_time is None:
-                        st.error("That day is fully booked - please choose another date.")
-                    else:
-                        ok, msg = create_appointment(user["id"], service_key, appt_date, appt_time, notes or "")
-                        if ok:
-                            st.success("Appointment booked! See it below.")
-                            st.rerun()
-                        else:
-                            st.error(msg)
-
-            st.markdown("#### Your Appointments")
-            appts = get_appointments(user["id"])
-            if not appts:
-                st.markdown(
-                    '<p style="color:#847f72;">No appointments yet - book your first one above.</p>',
-                    unsafe_allow_html=True,
-                )
-            else:
-                if "editing_appt_id" not in st.session_state:
-                    st.session_state.editing_appt_id = None
-
-                for appt_id, service, price, appt_date_str, appt_time_str, appt_notes, status in appts:
-                    pretty_date = datetime.strptime(appt_date_str, "%Y-%m-%d").strftime("%b %d, %Y")
-                    raw_html(
-                        f"""
-                        <div class="appt-card">
-                            <div>
-                                <div class="appt-service">{service} · {price}</div>
-                                <div class="appt-meta"><span class="gold-tag">{pretty_date} at {appt_time_str}</span></div>
-                            </div>
-                            <div class="status-pill status-{status}">{status}</div>
-                        </div>
-                        """
-                    )
-                    if status == "Confirmed":
-                        with st.container(key=f"appt_actions_{appt_id}"):
-                            btn_a, btn_b = st.columns(2)
-                            with btn_a:
-                                if st.button("Change Time", key=f"change_{appt_id}"):
-                                    st.session_state.editing_appt_id = (
-                                        None if st.session_state.editing_appt_id == appt_id else appt_id
-                                    )
-                                    st.rerun()
-                            with btn_b:
-                                if st.button("Cancel", key=f"cancel_{appt_id}"):
-                                    cancel_appointment(appt_id, user["id"])
-                                    st.rerun()
-
-                        if st.session_state.editing_appt_id == appt_id:
-                            # Not st.form — the time list has to refresh live
-                            # as soon as a new date is picked, so it only ever
-                            # shows slots that are actually still open.
-                            with st.container(key=f"reschedule_widget_{appt_id}"):
-                                st.markdown(f"**Reschedule - {service}**")
-                                rc_a, rc_b = st.columns(2)
-                                with rc_a:
-                                    new_date = st.date_input(
-                                        "New date",
-                                        min_value=date.today(),
-                                        max_value=date.today() + timedelta(days=60),
-                                        value=datetime.strptime(appt_date_str, "%Y-%m-%d").date(),
-                                        key=f"reschedule_date_{appt_id}",
-                                    )
-                                with rc_b:
-                                    booked_times = get_booked_times(new_date.isoformat(), exclude_appt_id=appt_id)
-                                    available_times = [t for t in time_slots_for_date(new_date) if t not in booked_times]
-                                    if new_date.isoformat() == appt_date_str and appt_time_str not in available_times:
-                                        available_times = [appt_time_str] + available_times
-                                    if available_times:
-                                        current_idx = (
-                                            available_times.index(appt_time_str)
-                                            if appt_time_str in available_times
-                                            else 0
-                                        )
-                                        new_time = st.selectbox(
-                                            "New time",
-                                            available_times,
-                                            index=current_idx,
-                                            key=f"reschedule_time_{appt_id}",
-                                        )
-                                    else:
-                                        new_time = None
-                                        st.selectbox(
-                                            "New time",
-                                            ["Fully booked - pick another day"],
-                                            disabled=True,
-                                            key=f"reschedule_time_full_{appt_id}",
-                                        )
-                                save_col, cancel_col = st.columns(2)
-                                with save_col:
-                                    save_clicked = st.button("Save New Time", key=f"reschedule_save_{appt_id}")
-                                with cancel_col:
-                                    cancel_clicked = st.button("Nevermind", key=f"reschedule_cancel_{appt_id}")
-                                if save_clicked:
-                                    if new_time is None:
-                                        st.error("That day is fully booked - please choose another date.")
-                                    else:
-                                        ok, msg = reschedule_appointment(appt_id, user["id"], new_date, new_time)
-                                        if ok:
-                                            st.session_state.editing_appt_id = None
-                                            st.success("Appointment updated.")
-                                            st.rerun()
-                                        else:
-                                            st.error(msg)
-                                if cancel_clicked:
-                                    st.session_state.editing_appt_id = None
-                                    st.rerun()
-
-    st.markdown("<div style='height:60px;'></div>", unsafe_allow_html=True)
-
-# ----------------------------------------------------------------------------
-# INSTAGRAM PAGE
-# ----------------------------------------------------------------------------
-def render_instagram():
-    raw_html(
-        f"""
-        <div class="section" style="text-align:center;">
-            <div class="section-head" style="text-align:center;">
-                <div class="eyebrow" style="justify-content:center;">Stay Connected</div>
-                <h2 class="section-title">Follow @fadedforless</h2>
-                <div class="divider" style="margin-left:auto; margin-right:auto;"></div>
-            </div>
-            <div class="insta-panel">
-                <div class="insta-icon">📷</div>
-                <div class="insta-handle">@fadedforless</div>
-                <p class="insta-sub">
-                    Fresh cuts, before-and-afters, and booking updates - all posted on Instagram.
-                    Follow along to see the latest work and stay up to date.
-                </p>
-                <a class="btn-insta" href="{INSTAGRAM_URL}" target="_blank">Follow on Instagram</a>
-            </div>
-        </div>
-        """
-    )
-
-# ----------------------------------------------------------------------------
-# YOUR APPOINTMENTS PAGE (admin/owner only — calendar of every booking)
-# ----------------------------------------------------------------------------
-def render_my_schedule():
-    user = st.session_state.user
-    if not user or not user.get("is_admin"):
-        st.warning("This page is only available to the shop owner.")
-        return
-
-    raw_html(
-        """
-        <div class="section" style="padding-bottom:20px;">
-            <div class="booking-head">
-                <div class="eyebrow" style="justify-content:center;">Owner View</div>
-                <h2 class="section-title">Your Appointments</h2>
-                <div class="divider" style="margin-left:auto; margin-right:auto;"></div>
-                <p class="section-sub" style="margin:14px auto 0 auto;">
-                    Every customer's booking, all in one calendar.
-                </p>
-            </div>
-        </div>
-        """
-    )
-
-    left, mid, right = st.columns([1, 2.6, 1])
-    with mid:
-        all_appts = get_all_appointments()
-        active_appts = [a for a in all_appts if a[6] == "Confirmed"]
-
-        by_date = {}
-        for appt in active_appts:
-            by_date.setdefault(appt[3], []).append(appt)
-
-        if "schedule_month" not in st.session_state:
-            today = date.today()
-            st.session_state.schedule_month = (today.year, today.month)
-
-        year, month = st.session_state.schedule_month
-
-        nav_prev, nav_label, nav_next = st.columns([1, 3, 1])
-        with nav_prev:
-            if st.button("← Prev"):
-                m = month - 1
-                y = year
-                if m == 0:
-                    m, y = 12, year - 1
-                st.session_state.schedule_month = (y, m)
-                st.rerun()
-        with nav_label:
-            st.markdown(
-                f"<h4 style='text-align:center; margin:6px 0;'>{cal_module.month_name[month]} {year}</h4>",
-                unsafe_allow_html=True,
-            )
-        with nav_next:
-            if st.button("Next →"):
-                m = month + 1
-                y = year
-                if m == 13:
-                    m, y = 1, year + 1
-                st.session_state.schedule_month = (y, m)
-                st.rerun()
-
-        weeks = cal_module.Calendar(firstweekday=6).monthdayscalendar(year, month)
-        dow_html = "".join(f'<div class="cal-dow">{d}</div>' for d in ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"])
-        cells_html = ""
-        today = date.today()
-        for week in weeks:
-            for day_num in week:
-                if day_num == 0:
-                    cells_html += '<div class="cal-cell empty"></div>'
-                    continue
-                this_date = date(year, month, day_num)
-                iso = this_date.isoformat()
-                count = len(by_date.get(iso, []))
-                today_class = " today" if this_date == today else ""
-                count_html = f'<div class="cal-count">{count} booked</div>' if count else ""
-                cells_html += f'<div class="cal-cell{today_class}"><div class="cal-daynum">{day_num}</div>{count_html}</div>'
-        raw_html(f'<div class="cal-grid">{dow_html}{cells_html}</div>')
-
-        st.markdown("#### Pick a day to see the schedule")
-        picked_day = st.date_input(
-            "Day",
-            value=today,
-            min_value=date(year, month, 1),
-            max_value=date(year, month, cal_module.monthrange(year, month)[1]),
-            label_visibility="collapsed",
-        )
-        day_appts = by_date.get(picked_day.isoformat(), [])
-        if not day_appts:
-            st.markdown(
-                '<p style="color:#847f72;">No appointments booked for this day.</p>',
-                unsafe_allow_html=True,
-            )
-        else:
-            for appt_id, service, price, appt_date_str, appt_time_str, notes, status, cust_name, cust_phone, cust_email in day_appts:
-                contact = cust_phone or cust_email or ""
-                raw_html(
-                    f"""
-                    <div class="admin-appt-row">
-                        <div class="admin-appt-time">{appt_time_str}</div>
-                        <div style="flex:1; min-width:160px;">
-                            <div class="admin-appt-cust">{cust_name}</div>
-                            <div class="admin-appt-service"><span class="gold-tag">{service} · {price}{" · " + contact if contact else ""}</span></div>
-                        </div>
-                    </div>
-                    """
-                )
-
-        st.markdown("<div style='height:20px;'></div>", unsafe_allow_html=True)
-        st.markdown("#### All Upcoming Appointments")
-        raw_html('<p style="color:#E9E4D6; font-size:0.88rem; margin-top:-6px;">Change or cancel any customer\'s appointment right here.</p>')
-        upcoming = [a for a in active_appts if a[3] >= today.isoformat()]
-        if not upcoming:
-            st.markdown(
-                '<p style="color:#847f72;">Nothing upcoming.</p>',
-                unsafe_allow_html=True,
-            )
-        else:
-            if "admin_editing_appt_id" not in st.session_state:
-                st.session_state.admin_editing_appt_id = None
-
-            for appt_id, service, price, appt_date_str, appt_time_str, notes, status, cust_name, cust_phone, cust_email in upcoming:
-                pretty_date = datetime.strptime(appt_date_str, "%Y-%m-%d").strftime("%b %d, %Y")
-                contact = cust_phone or cust_email or ""
-                raw_html(
-                    f"""
-                    <div class="admin-appt-row">
-                        <div class="admin-appt-time">{pretty_date}<br>{appt_time_str}</div>
-                        <div style="flex:1; min-width:160px;">
-                            <div class="admin-appt-cust">{cust_name}</div>
-                            <div class="admin-appt-service"><span class="gold-tag">{service} · {price}{" · " + contact if contact else ""}</span></div>
-                        </div>
-                    </div>
-                    """
-                )
-                with st.container(key=f"admin_appt_actions_{appt_id}"):
-                    btn_a, btn_b = st.columns(2)
-                    with btn_a:
-                        if st.button("Change Time", key=f"admin_change_{appt_id}"):
-                            st.session_state.admin_editing_appt_id = (
-                                None if st.session_state.admin_editing_appt_id == appt_id else appt_id
-                            )
-                            st.rerun()
-                    with btn_b:
-                        if st.button("Cancel", key=f"admin_cancel_{appt_id}"):
-                            admin_cancel_appointment(appt_id)
-                            st.rerun()
-
-                if st.session_state.admin_editing_appt_id == appt_id:
-                    # Not st.form — same reasoning as the customer reschedule:
-                    # the time list must refresh the instant the date changes.
-                    with st.container(key=f"admin_reschedule_widget_{appt_id}"):
-                        st.markdown(f"**Reschedule {cust_name} - {service}**")
-                        rc_a, rc_b = st.columns(2)
-                        with rc_a:
-                            new_date = st.date_input(
-                                "New date",
-                                min_value=date.today(),
-                                max_value=date.today() + timedelta(days=60),
-                                value=datetime.strptime(appt_date_str, "%Y-%m-%d").date(),
-                                key=f"admin_reschedule_date_{appt_id}",
-                            )
-                        with rc_b:
-                            booked_times = get_booked_times(new_date.isoformat(), exclude_appt_id=appt_id)
-                            available_times = [t for t in time_slots_for_date(new_date) if t not in booked_times]
-                            if new_date.isoformat() == appt_date_str and appt_time_str not in available_times:
-                                available_times = [appt_time_str] + available_times
-                            if available_times:
-                                current_idx = (
-                                    available_times.index(appt_time_str)
-                                    if appt_time_str in available_times
-                                    else 0
-                                )
-                                new_time = st.selectbox(
-                                    "New time",
-                                    available_times,
-                                    index=current_idx,
-                                    key=f"admin_reschedule_time_{appt_id}",
-                                )
-                            else:
-                                new_time = None
-                                st.selectbox(
-                                    "New time",
-                                    ["Fully booked - pick another day"],
-                                    disabled=True,
-                                    key=f"admin_reschedule_time_full_{appt_id}",
-                                )
-                        save_col, cancel_col = st.columns(2)
-                        with save_col:
-                            save_clicked = st.button("Save New Time", key=f"admin_reschedule_save_{appt_id}")
-                        with cancel_col:
-                            cancel_clicked = st.button("Nevermind", key=f"admin_reschedule_cancel_{appt_id}")
-                        if save_clicked:
-                            if new_time is None:
-                                st.error("That day is fully booked - please choose another date.")
-                            else:
-                                ok, msg = admin_reschedule_appointment(appt_id, new_date, new_time)
-                                if ok:
-                                    st.session_state.admin_editing_appt_id = None
-                                    st.success("Appointment updated.")
-                                    st.rerun()
-                                else:
-                                    st.error(msg)
-                        if cancel_clicked:
-                            st.session_state.admin_editing_appt_id = None
-                            st.rerun()
-
-    st.markdown("<div style='height:60px;'></div>", unsafe_allow_html=True)
-
-
-# ----------------------------------------------------------------------------
-# CUSTOMERS PAGE (admin/owner only) — every registered customer, their
-# contact info, and their haircut history at a glance.
-# ----------------------------------------------------------------------------
-def render_customers():
-    user = st.session_state.user
-    if not user or not user.get("is_admin"):
-        st.warning("This page is only available to the shop owner.")
-        return
-
-    raw_html(
-        """
-        <div class="section" style="padding-bottom:10px;">
-            <div class="booking-head">
-                <div class="eyebrow" style="justify-content:center;">Owner View</div>
-                <h2 class="section-title">Customer Data</h2>
-                <div class="divider" style="margin-left:auto; margin-right:auto;"></div>
-                <p class="section-sub" style="margin:14px auto 0 auto;">
-                    Every registered customer - full name, phone, how many times they've
-                    come in, and the different haircuts they've gotten.
-                </p>
-            </div>
-        </div>
-        """
-    )
-    left2, mid2, right2 = st.columns([1, 2.6, 1])
-    with mid2:
-        customer_stats = get_customer_stats()
-        if not customer_stats:
-            st.markdown(
-                '<p style="color:#847f72;">No customers have signed up yet.</p>',
-                unsafe_allow_html=True,
-            )
-        else:
-            st.dataframe(customer_stats, use_container_width=True, hide_index=True)
-
-            st.markdown("<div style='height:32px;'></div>", unsafe_allow_html=True)
-            st.markdown("#### Customer Details")
-            st.markdown(
-                '<p style="color:#847f72; margin-top:-6px;">Open a name to see their appointments '
-                'and what the Style AI told them about their hair.</p>',
-                unsafe_allow_html=True,
-            )
-
-            conn = get_conn()
-            customers = conn.execute(
-                "SELECT id, name, phone FROM users ORDER BY name COLLATE NOCASE ASC"
-            ).fetchall()
-            for cust_id, cust_name, cust_phone in customers:
-                cust_appts = get_appointments(cust_id)
-                cust_notes = get_style_notes(cust_id)
-                with st.expander(f"{cust_name}" + (f" · {cust_phone}" if cust_phone else "")):
-                    st.markdown("**Appointments**")
-                    if not cust_appts:
-                        st.markdown(
-                            '<p style="color:#847f72;">No appointments yet.</p>',
-                            unsafe_allow_html=True,
-                        )
-                    else:
-                        for _appt_id, service, price, appt_date_str, appt_time_str, _notes, status in cust_appts:
-                            pretty_date = datetime.strptime(appt_date_str, "%Y-%m-%d").strftime("%b %d, %Y")
-                            raw_html(
-                                f"""
-                                <div class="appt-card">
-                                    <div>
-                                        <div class="appt-service">{service} · {price}</div>
-                                        <div class="appt-meta"><span class="gold-tag">{pretty_date} at {appt_time_str}</span></div>
-                                    </div>
-                                    <div class="status-pill status-{status}">{status}</div>
-                                </div>
-                                """
-                            )
-
-                    st.markdown("<div style='height:14px;'></div>", unsafe_allow_html=True)
-                    st.markdown("**What the Style AI told them**")
-                    if not cust_notes:
-                        st.markdown(
-                            '<p style="color:#847f72;">Hasn\'t used the Style AI yet.</p>',
-                            unsafe_allow_html=True,
-                        )
-                    else:
-                        for note, created_at in cust_notes:
-                            pretty_ts = datetime.fromisoformat(created_at).strftime("%b %d, %Y at %I:%M %p")
-                            raw_html(
-                                f"""
-                                <div class="appt-card" style="flex-direction:column; align-items:flex-start; gap:6px;">
-                                    <div class="appt-meta"><span class="gold-tag">{pretty_ts}</span></div>
-                                    <p style="margin:0; color:#EDEAE2;">{note}</p>
-                                </div>
-                                """
-                            )
-
-    st.markdown("<div style='height:60px;'></div>", unsafe_allow_html=True)
-
-
-# ----------------------------------------------------------------------------
-# SETTINGS PAGE — device view switch (for everyone) plus, for customers,
-# an editable profile: picture, email, phone.
-# ----------------------------------------------------------------------------
-def render_settings():
-    user = st.session_state.user
-    if not user:
-        st.warning("Please log in to view Settings.")
-        return
-
-    raw_html(
-        """
-        <div class="section" style="padding-bottom:10px;">
-            <div class="booking-head">
-                <div class="eyebrow" style="justify-content:center;">Account</div>
-                <h2 class="section-title">Settings</h2>
-                <div class="divider" style="margin-left:auto; margin-right:auto;"></div>
-            </div>
-        </div>
-        """
-    )
-
-    if st.session_state.pop("avail_just_saved", False):
-        st.success("Availability saved ✓")
-
-    left, mid, right = st.columns([1, 2.2, 1])
-    with mid:
-        if user.get("is_admin"):
-            st.markdown("#### Availability")
-            st.markdown(
-                '<p style="color:#847f72; margin-top:-6px;">Set the hours customers are allowed '
-                'to book or reschedule into — pick different hours for each day, or mark a day '
-                'closed entirely.</p>',
-                unsafe_allow_html=True,
-            )
-            day_inputs = {}
-            for wd_key, wd_label in WEEKDAYS:
-                cur_start, cur_end, cur_closed = get_day_hours(wd_key)
-                with st.container(key=f"avail_row_{wd_key}"):
-                    day_a, day_b, day_c = st.columns([1.1, 1.1, 0.8])
-                    with day_a:
-                        start_idx = FULL_DAY_SLOTS.index(cur_start) if cur_start in FULL_DAY_SLOTS else 0
-                        d_start = st.selectbox(
-                            f"{wd_label} opens",
-                            FULL_DAY_SLOTS,
-                            index=start_idx,
-                            key=f"avail_{wd_key}_start_select",
-                            disabled=cur_closed,
-                        )
-                    with day_b:
-                        end_idx = (
-                            FULL_DAY_SLOTS.index(cur_end) if cur_end in FULL_DAY_SLOTS else len(FULL_DAY_SLOTS) - 1
-                        )
-                        d_end = st.selectbox(
-                            f"{wd_label} closes",
-                            FULL_DAY_SLOTS,
-                            index=end_idx,
-                            key=f"avail_{wd_key}_end_select",
-                            disabled=cur_closed,
-                        )
-                    with day_c:
-                        st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
-                        d_closed = st.checkbox("Closed", value=cur_closed, key=f"avail_{wd_key}_closed_check")
-                day_inputs[wd_key] = (d_start, d_end, d_closed)
-
-            if st.button("Save Availability", key="avail_save_btn"):
-                errors = []
-                for wd_key, wd_label in WEEKDAYS:
-                    d_start, d_end, d_closed = day_inputs[wd_key]
-                    if not d_closed and datetime.strptime(d_end, "%I:%M %p") <= datetime.strptime(d_start, "%I:%M %p"):
-                        errors.append(wd_label)
-                if errors:
-                    st.error(f"Closing time has to be after opening time for: {', '.join(errors)}.")
-                else:
-                    for wd_key, wd_label in WEEKDAYS:
-                        d_start, d_end, d_closed = day_inputs[wd_key]
-                        set_setting(f"avail_{wd_key}_start", d_start)
-                        set_setting(f"avail_{wd_key}_end", d_end)
-                        set_setting(f"avail_{wd_key}_closed", "1" if d_closed else "0")
-                    st.session_state.avail_just_saved = True
-                    st.rerun()
-
-            st.markdown("<div style='height:32px;'></div>", unsafe_allow_html=True)
-            st.markdown("#### Email Notifications")
-            if email_is_configured():
-                st.markdown(
-                    f'<p style="color:#847f72;">Sending as <strong style="color:#EDEAE2;">{GMAIL_ADDRESS}</strong> &middot; '
-                    f'Owner alerts go to <strong style="color:#EDEAE2;">{OWNER_EMAIL}</strong></p>',
-                    unsafe_allow_html=True,
-                )
-            else:
-                st.markdown(
-                    '<p style="color:#e06666;">Not configured — the GMAIL_APP_PASSWORD secret is missing or empty.</p>',
-                    unsafe_allow_html=True,
-                )
-            st.markdown(
-                '<p style="color:#847f72;">Profile editing is for customer accounts only.</p>',
-                unsafe_allow_html=True,
-            )
-            return
-
-        st.markdown("#### Profile")
-        current_pic = user.get("profile_pic")
-        if current_pic:
-            raw_html(
-                f'<img src="{current_pic}" alt="Profile picture" '
-                f'style="width:120px; height:120px; border-radius:50%; object-fit:cover; '
-                f'border:2px solid var(--gold); margin-bottom:14px;" />'
-            )
-        uploaded_pic = st.file_uploader(
-            "Profile picture", type=["png", "jpg", "jpeg"], key="settings_pic_upload"
-        )
-
-        new_email = st.text_input("Email", value=user.get("email", ""), key="settings_email")
-        new_phone = st.text_input("Phone Number", value=user.get("phone", "") or "", key="settings_phone")
-
-        if st.button("Save Changes", key="settings_save_btn"):
-            if not EMAIL_RE.match(new_email):
-                st.error("Please enter a valid email address.")
-            elif not PHONE_RE.match(new_phone):
-                st.error("Please enter a valid phone number.")
-            else:
-                pic_b64 = None
-                if uploaded_pic is not None:
-                    ext = uploaded_pic.name.rsplit(".", 1)[-1].lower()
-                    mime = "image/png" if ext == "png" else "image/jpeg"
-                    encoded = base64.b64encode(uploaded_pic.getvalue()).decode("ascii")
-                    pic_b64 = f"data:{mime};base64,{encoded}"
-                ok, msg = update_profile(user["id"], new_email, new_phone, pic_b64)
-                if ok:
-                    st.session_state.user["email"] = new_email.strip().lower()
-                    st.session_state.user["phone"] = new_phone.strip()
-                    if pic_b64:
-                        st.session_state.user["profile_pic"] = pic_b64
-                    st.success("Profile updated.")
-                    st.rerun()
-                else:
-                    st.error(msg)
-
-    st.markdown("<div style='height:60px;'></div>", unsafe_allow_html=True)
-
-
-# ----------------------------------------------------------------------------
-# STYLE PAGE — customers take one photo and get a haircut/fade recommendation
-# (auto-shared with Freddie); the owner gets a separate 3-photo (back/side/
-# top) cutting-plan tool. Both can keep chatting with the AI afterward.
-# ----------------------------------------------------------------------------
-def render_style_chat():
-    """Shared AI-chat follow-up, shown under a recommendation for both
-    customers and the owner — lets them keep asking Gemini questions about
-    the cut without retaking photos."""
-    if "style_chat_history" not in st.session_state or not st.session_state.style_chat_history:
-        return
-
-    st.markdown("<div style='height:22px;'></div>", unsafe_allow_html=True)
-    st.markdown("**Keep talking about it**")
-    for msg in st.session_state.style_chat_history[1:]:  # skip the initial photo turn
-        if msg["role"] == "user":
-            raw_html(
-                f"""
-                <div class="appt-card" style="background:rgba(212,175,55,0.08);">
-                    <p style="margin:0; color:#EDEAE2;">{msg['text']}</p>
-                </div>
-                """
-            )
-        else:
-            raw_html(
-                f"""
-                <div class="appt-card" style="flex-direction:column; align-items:flex-start;">
-                    <p style="margin:0; color:#EDEAE2;">{msg['text']}</p>
-                </div>
-                """
-            )
-
-    with st.form("style_chat_form", clear_on_submit=True):
-        follow_up = st.text_input("Ask a follow-up question", key="style_chat_input")
-        sent = st.form_submit_button("Send")
-    if sent and follow_up.strip():
-        st.session_state.style_chat_history.append({"role": "user", "text": follow_up.strip()})
-        with st.spinner("Thinking..."):
-            ok, reply = style_chat_reply(st.session_state.style_chat_history)
-        if ok:
-            st.session_state.style_chat_history.append({"role": "model", "text": reply})
-        else:
-            st.error(reply)
-            st.session_state.style_chat_history.pop()
-        st.rerun()
-
-
-def photo_input_widget(key_prefix, cam_label):
-    """Lets the customer or owner either take a live photo or upload one
-    already saved on their device. Returns (image_bytes, mime_type) or None
-    if nothing has been captured/chosen yet."""
-    mode = st.radio(
-        "Photo source",
-        ["Take Photo", "Upload Photo"],
-        key=f"{key_prefix}_mode",
-        horizontal=True,
-        label_visibility="collapsed",
-    )
-    if mode == "Take Photo":
-        photo = st.camera_input(cam_label, key=f"{key_prefix}_camera")
-        if photo is not None:
-            return photo.getvalue(), photo.type or "image/jpeg"
-        return None
-    else:
-        uploaded = st.file_uploader(cam_label, type=["png", "jpg", "jpeg"], key=f"{key_prefix}_upload")
-        if uploaded is not None:
-            ext = uploaded.name.rsplit(".", 1)[-1].lower()
-            mime = "image/png" if ext == "png" else "image/jpeg"
-            return uploaded.getvalue(), mime
-        return None
-
-
-def render_style():
-    user = st.session_state.user
-    if not user:
-        st.warning("Please log in to use Style AI.")
-        return
-
-    is_owner = bool(user.get("is_admin"))
-
-    raw_html(
-        f"""
-        <div class="section" style="padding-bottom:10px;">
-            <div class="booking-head">
-                <div class="eyebrow" style="justify-content:center;">Virtual AI Consultation</div>
-                <h2 class="section-title">{"Virtual AI Consultation — Owner Tool" if is_owner else "Your Virtual AI Consultation"}</h2>
-                <div class="divider" style="margin-left:auto; margin-right:auto;"></div>
-                <p class="section-sub" style="margin:14px auto 0 auto;">
-                    {"Upload three angles of a customer's head and get a precise cutting plan — top, fade or not, which fade, and whether it's sides only." if is_owner else "Snap a photo and get a fade and haircut recommendation before you sit in the chair."}
-                </p>
-            </div>
-        </div>
-        """
-    )
-
-    with st.container(key="style_photo_widget"):
-        left, mid, right = st.columns([1, 3.4, 1])
-        with mid:
-            if is_owner:
-                # Three separate st.camera_input widgets mounted on the page
-                # at once was the actual bug some phones hit (only the last
-                # one could ever get a live camera stream — the other two
-                # stayed stuck on the "would like to use your camera" prompt
-                # forever). Rendering exactly one camera_input at a time,
-                # one step at a time, avoids that entirely.
-                OWNER_STEPS = [
-                    ("back", "Back", "Back of the head"),
-                    ("side", "Side", "Side of the head"),
-                    ("top", "Top / Front", "Top or front of the head"),
-                ]
-                if "owner_photo_step" not in st.session_state:
-                    st.session_state.owner_photo_step = 0
-                if "owner_photos" not in st.session_state:
-                    st.session_state.owner_photos = {}
-
-                step = st.session_state.owner_photo_step
-
-                for i, (pkey, plabel, _) in enumerate(OWNER_STEPS[:step]):
-                    data = st.session_state.owner_photos.get(pkey)
-                    if data:
-                        thumb_col, info_col = st.columns([1, 3])
-                        with thumb_col:
-                            st.image(data[0], width=90)
-                        with info_col:
-                            st.markdown(f"**{plabel}** captured ✓")
-                            if st.button(f"Retake {plabel}", key=f"retake_owner_{pkey}"):
-                                st.session_state.owner_photo_step = i
-                                st.session_state.owner_photos.pop(pkey, None)
-                                st.rerun()
-
-                if step < len(OWNER_STEPS):
-                    pkey, plabel, cam_label = OWNER_STEPS[step]
-                    st.markdown(f"**{plabel}**")
-                    photo_data = photo_input_widget(f"style_photo_{pkey}", cam_label)
-                    if photo_data is not None:
-                        if st.button("Use This Photo", key=f"confirm_owner_{pkey}"):
-                            st.session_state.owner_photos[pkey] = photo_data
-                            st.session_state.owner_photo_step += 1
-                            st.rerun()
-                else:
-                    st.success("All three photos captured.")
-                    if st.button("Retake All", key="retake_all_owner"):
-                        st.session_state.owner_photo_step = 0
-                        st.session_state.owner_photos = {}
-                        st.session_state.style_result_text = None
-                        st.session_state.pop("style_chat_history", None)
-                        st.rerun()
-                    if st.button("Get Cutting Plan", key="style_analyze_btn_owner"):
-                        with st.spinner("Analyzing the three photos..."):
-                            photos = [
-                                st.session_state.owner_photos["back"],
-                                st.session_state.owner_photos["side"],
-                                st.session_state.owner_photos["top"],
-                            ]
-                            ok, result = analyze_style_photos_owner(photos)
-                        if ok:
-                            st.session_state.style_result_text = result
-                            st.session_state.style_chat_history = [{"role": "model", "text": result}]
-                        else:
-                            st.session_state.style_result_text = None
-                            st.session_state.pop("style_chat_history", None)
-                            st.error(result)
-
-                if st.session_state.get("style_result_text"):
-                    raw_html(
-                        f"""
-                        <div class="appt-card" style="flex-direction:column; align-items:flex-start; gap:10px;">
-                            <div class="appt-service">Cutting Plan</div>
-                            <p style="margin:0; color:#EDEAE2; font-size:1.08rem; line-height:1.65; white-space:pre-line;">{st.session_state.style_result_text}</p>
-                        </div>
-                        """
-                    )
-                    render_style_chat()
-
-            else:
-                photo_data = photo_input_widget("style_photo_customer", "Take a photo")
-                if photo_data is not None:
-                    if st.button("Get My Recommendation", key="style_analyze_btn"):
-                        with st.spinner("Analyzing your photo..."):
-                            ok, result = analyze_style_photo(photo_data[0], mime_type=photo_data[1])
-                        if ok:
-                            # Automatically shared with Freddie the moment it's
-                            # generated — no extra step for the customer.
-                            save_style_note(user["id"], result)
-                            st.session_state.style_result_text = result
-                            st.session_state.style_chat_history = [{"role": "model", "text": result}]
-                        else:
-                            st.session_state.style_result_text = None
-                            st.session_state.pop("style_chat_history", None)
-                            st.error(result)
-
-                if st.session_state.get("style_result_text"):
-                    raw_html(
-                        f"""
-                        <div class="appt-card" style="flex-direction:column; align-items:flex-start; gap:10px;">
-                            <div class="appt-service">Your Recommendation</div>
-                            <p style="margin:0; color:#EDEAE2; font-size:1.08rem; line-height:1.65;">{st.session_state.style_result_text}</p>
-                        </div>
-                        """
-                    )
-                    st.success("Sent to Freddie ✓ - he'll have this before your appointment.")
-                    render_style_chat()
-
-    st.markdown("<div style='height:60px;'></div>", unsafe_allow_html=True)
-
-
-# ----------------------------------------------------------------------------
-# ROUTER
-# ----------------------------------------------------------------------------
-if current_page == "Home":
-    render_home()
-elif current_page == "About Me":
-    render_about()
-elif current_page == "Pricing":
-    render_pricing()
-elif current_page == "What You Get":
-    render_what_you_get()
-elif current_page == "Book Now":
-    render_book_now()
-elif current_page == "Log In":
-    render_login()
-elif current_page == "Your Appointments":
-    render_my_schedule()
-elif current_page == "Customers":
-    render_customers()
-elif current_page == "Settings":
-    render_settings()
-elif current_page == "Style":
-    render_style()
-
-# ----------------------------------------------------------------------------
-# FOOTER
-# ----------------------------------------------------------------------------
-raw_html(
-    """
-    <div class="footer">
-        FADED<span>FOR</span>LESS - Premium cuts. Fair prices.
-    </div>
-    """
-)
-
-#.\.venv\Scripts\Activate.ps1; streamlit run app.py
-#git add .; git commit -m "Update website"; git push
+# BOOK NOW PAG
