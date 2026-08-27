@@ -1738,6 +1738,114 @@ raw_html(
     .status-Confirmed{ background:rgba(212,175,55,0.15); color:var(--gold-light); border:1px solid rgba(212,175,55,0.4); }
     .status-Cancelled{ background:rgba(200,60,60,0.12); color:#e28080; border:1px solid rgba(200,60,60,0.35); }
 
+    /* ---------- BOOKING PANEL (Book Now page redesign) ---------- */
+    /* Wraps the whole "Book an Appointment" form in the same dark card
+       treatment used elsewhere on the site (see .stForm), so it reads as
+       one cohesive panel instead of loose widgets floating on the page.
+       Pure CSS on an existing st.container(key=...) — no extra widgets,
+       no performance cost. */
+    .st-key-booking_widget{
+        background:var(--charcoal-2);
+        border:1px solid rgba(212,175,55,0.22);
+        border-radius:12px;
+        padding:30px 30px 26px 30px;
+        margin-bottom:26px;
+    }
+    .st-key-customer_header{
+        background:var(--charcoal-2);
+        border:1px solid rgba(212,175,55,0.18);
+        border-radius:12px;
+        padding:18px 24px;
+        margin-bottom:22px;
+    }
+    /* Step labels that break the booking form into clear, ordered sections
+       (Service / Date & Time / Notes) instead of one long stack of
+       widgets. */
+    .booking-step-label{
+        display:flex;
+        align-items:center;
+        gap:10px;
+        margin:26px 0 14px 0;
+        text-transform:uppercase;
+        letter-spacing:1.5px;
+        font-size:0.78rem;
+        font-weight:700;
+        color:var(--gold-light);
+    }
+    .booking-step-label:first-child{ margin-top:0; }
+    .booking-step-label .step-num{
+        display:inline-flex;
+        align-items:center;
+        justify-content:center;
+        width:22px; height:22px;
+        border-radius:50%;
+        background:linear-gradient(120deg, var(--gold-light), var(--gold));
+        color:var(--premium-black);
+        font-size:0.72rem;
+        font-weight:800;
+        flex-shrink:0;
+    }
+    /* Visual, tappable service cards replacing the plain dropdown. Reuses
+       the same base64 images already loaded for the Pricing page, so
+       there's no extra network/image cost. */
+    .service-card{
+        background:var(--charcoal-3);
+        border:1px solid rgba(212,175,55,0.2);
+        border-radius:10px;
+        overflow:hidden;
+        transition:border-color 0.2s ease, box-shadow 0.2s ease;
+        margin-bottom:8px;
+    }
+    .service-card.selected{
+        border:1px solid var(--gold);
+        box-shadow:0 0 0 1px rgba(212,175,55,0.25);
+    }
+    .service-card-img{
+        height:86px;
+        background-size:cover;
+        background-position:center;
+    }
+    .service-card-body{ padding:12px 14px 14px 14px; position:relative; }
+    .service-card-name{ color:#F5F1E6; font-weight:700; font-size:0.92rem; }
+    .service-card-price{ color:var(--gold); font-weight:800; font-size:1.15rem; margin:2px 0 6px 0; }
+    .service-card-check{
+        position:absolute;
+        top:10px; right:12px;
+        color:var(--gold);
+        font-size:1rem;
+    }
+    .slots-caption{
+        color:#847f72;
+        font-size:0.8rem;
+        margin-top:6px;
+    }
+    /* Live summary of the current selection, shown just above the Confirm
+       button so there's no doubt what's about to be booked. */
+    .booking-summary{
+        background:var(--charcoal-3);
+        border-left:3px solid var(--gold);
+        border-radius:6px;
+        padding:14px 18px;
+        margin:22px 0 18px 0;
+    }
+    .booking-summary-label{
+        text-transform:uppercase;
+        letter-spacing:1px;
+        font-size:0.68rem;
+        color:#847f72;
+        margin-bottom:4px;
+    }
+    .booking-summary-line{ color:#F5F1E6; font-weight:700; font-size:0.98rem; }
+    .appt-group-label{
+        text-transform:uppercase;
+        letter-spacing:1.5px;
+        font-size:0.78rem;
+        font-weight:700;
+        color:var(--gold);
+        margin:22px 0 12px 0;
+    }
+    .appt-group-label:first-of-type{ margin-top:0; }
+
     /* ---------- ADMIN SCHEDULE / CALENDAR ---------- */
     .cal-grid{
         display:grid;
@@ -2096,6 +2204,11 @@ def go_to_service(page_name, service_key):
     st.session_state.preselect_service = service_key
     st.query_params["page"] = page_name
     st.session_state.mobile_menu_open = False
+
+
+def set_booking_service(service_key):
+    """Used by the visual service cards on the Book Now page itself."""
+    st.session_state.booking_service_choice = service_key
 
 
 def toggle_mobile_menu():
@@ -2718,15 +2831,51 @@ def render_book_now():
                         st.session_state.user = None
                         st.rerun()
 
-            st.markdown("#### Book an Appointment")
             # Not wrapped in st.form on purpose: the Time dropdown needs to
             # refresh the moment the Date changes, so it only ever offers
             # slots nobody else has already taken that day.
             with st.container(key="booking_widget"):
-                service_options = list(SERVICES.keys())
+                raw_html('<div class="booking-step-label"><span class="step-num">1</span>Choose Your Service</div>')
+
+                # Visual service cards (image + price + duration) instead of
+                # a plain dropdown. Reuses the Pricing page's already-cached
+                # images, so this costs nothing extra to load.
+                SERVICE_CARDS = [
+                    ("Fade or Trim - $10 (30 min)", IMG_PRICE_10, "$10", "30 min"),
+                    ("Full Haircut - $15 (1 hour)", IMG_PRICE_15, "$15", "1 hour"),
+                ]
                 preselected = st.session_state.pop("preselect_service", None)
-                default_idx = service_options.index(preselected) if preselected in service_options else 0
-                service_key = st.selectbox("Service", service_options, index=default_idx, key="booking_service")
+                if "booking_service_choice" not in st.session_state or preselected:
+                    st.session_state.booking_service_choice = preselected or SERVICE_CARDS[0][0]
+                service_key = st.session_state.booking_service_choice
+
+                card_cols = st.columns(2)
+                for (skey, simg, sprice, sdur), scol in zip(SERVICE_CARDS, card_cols):
+                    selected = skey == service_key
+                    with scol:
+                        raw_html(
+                            f"""
+                            <div class="service-card{' selected' if selected else ''}">
+                                <div class="service-card-img" style="background-image:url('{simg}');"></div>
+                                <div class="service-card-body">
+                                    {'<div class="service-card-check">✓</div>' if selected else ''}
+                                    <div class="service-card-name">{SERVICES[skey]['label']}</div>
+                                    <div class="service-card-price">{sprice}</div>
+                                    <span class="chip">{sdur}</span>
+                                </div>
+                            </div>
+                            """
+                        )
+                        st.button(
+                            "Selected ✓" if selected else "Choose This",
+                            key=f"pick_{skey}",
+                            type="primary" if selected else "secondary",
+                            use_container_width=True,
+                            on_click=set_booking_service,
+                            args=(skey,),
+                        )
+
+                raw_html('<div class="booking-step-label"><span class="step-num">2</span>Pick a Date &amp; Time</div>')
                 col_a, col_b = st.columns(2)
                 with col_a:
                     appt_date = st.date_input(
@@ -2758,8 +2907,26 @@ def render_book_now():
                             disabled=True,
                             key="booking_time_full",
                         )
-                notes = st.text_area("Notes (optional)", placeholder="Anything the barber should know", key="booking_notes")
-                if st.button("Confirm Appointment", key="booking_confirm_btn"):
+                if day_slots:
+                    raw_html(
+                        f'<div class="slots-caption">{len(available_times)} of {len(day_slots)} slots open that day</div>'
+                    )
+
+                raw_html('<div class="booking-step-label"><span class="step-num">3</span>Anything We Should Know?</div>')
+                notes = st.text_area("Notes (optional)", placeholder="Anything the barber should know", key="booking_notes", label_visibility="collapsed")
+
+                if appt_time is not None:
+                    pretty_selected_date = appt_date.strftime("%a, %b %d, %Y")
+                    raw_html(
+                        f"""
+                        <div class="booking-summary">
+                            <div class="booking-summary-label">You're About To Book</div>
+                            <div class="booking-summary-line">{SERVICES[service_key]['label']} · {SERVICES[service_key]['price']} — {pretty_selected_date} at {appt_time}</div>
+                        </div>
+                        """
+                    )
+
+                if st.button("Confirm Appointment", key="booking_confirm_btn", type="primary", use_container_width=True):
                     if appt_time is None:
                         st.error("That day is fully booked - please choose another date.")
                     else:
@@ -2771,9 +2938,9 @@ def render_book_now():
                         else:
                             st.error(msg)
 
-            st.markdown("#### Your Appointments")
             appts = get_appointments(user["id"])
             if not appts:
+                raw_html('<div class="appt-group-label">Your Appointments</div>')
                 st.markdown(
                     '<p style="color:#847f72;">No appointments yet - book your first one above.</p>',
                     unsafe_allow_html=True,
@@ -2782,7 +2949,8 @@ def render_book_now():
                 if "editing_appt_id" not in st.session_state:
                     st.session_state.editing_appt_id = None
 
-                for appt_id, service, price, appt_date_str, appt_time_str, appt_notes, status in appts:
+                def render_appt_row(appt):
+                    appt_id, service, price, appt_date_str, appt_time_str, appt_notes, status = appt
                     pretty_date = datetime.strptime(appt_date_str, "%Y-%m-%d").strftime("%b %d, %Y")
                     raw_html(
                         f"""
@@ -2870,6 +3038,29 @@ def render_book_now():
                                 if cancel_clicked:
                                     st.session_state.editing_appt_id = None
                                     st.rerun()
+
+                # Split into Upcoming (confirmed, today or later) vs Past/Cancelled
+                # so the list reads cleanly instead of one long undifferentiated
+                # stack - purely a client-side split of data already fetched,
+                # so it costs nothing extra.
+                today_iso = date.today().isoformat()
+                upcoming = [a for a in appts if a[3] >= today_iso and a[6] == "Confirmed"]
+                past = [a for a in appts if not (a[3] >= today_iso and a[6] == "Confirmed")]
+
+                raw_html('<div class="appt-group-label">Upcoming</div>')
+                if upcoming:
+                    for appt in upcoming:
+                        render_appt_row(appt)
+                else:
+                    st.markdown(
+                        '<p style="color:#847f72;">No upcoming appointments - book one above.</p>',
+                        unsafe_allow_html=True,
+                    )
+
+                if past:
+                    raw_html('<div class="appt-group-label">Past &amp; Cancelled</div>')
+                    for appt in past:
+                        render_appt_row(appt)
 
     st.markdown("<div style='height:60px;'></div>", unsafe_allow_html=True)
 
