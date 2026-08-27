@@ -8,6 +8,7 @@ import base64
 import calendar as cal_module
 import smtplib
 import ssl
+import threading
 from email.message import EmailMessage
 from datetime import date, datetime, timedelta
 
@@ -816,15 +817,34 @@ def _send_email_raw(to_email, subject, html_body):
         return False, f"{type(e).__name__}: {e}"
 
 
-def send_email(to_email, subject, html_body):
-    """Sends one HTML email via Gmail SMTP. Fails silently (just prints the
-    real error to the server log) instead of raising — a booking or signup
-    should never be blocked just because an email didn't go out. Use
-    _send_email_raw directly if you need to see WHY it failed."""
+def _send_email_background(to_email, subject, html_body):
     ok, error = _send_email_raw(to_email, subject, html_body)
     if not ok:
         print(f"[email] Failed to send to {to_email}: {error}")
-    return ok
+
+
+def send_email(to_email, subject, html_body):
+    """Fires off one HTML email via Gmail SMTP on a background thread and
+    returns immediately. Every signup/booking/cancel/reschedule used to call
+    this 2x (customer + owner) *synchronously* — each SMTP round trip (SSL
+    handshake + login + send) can easily take 1-3 seconds, so actions like
+    "Create Account" or "Confirm Appointment" were blocking the whole page
+    for several seconds with zero visual feedback. That's what made the
+    button feel dead and invited a second click - and on signup specifically,
+    that second click landed the request AFTER the first one had already
+    gone through, so it hit the UNIQUE email constraint and showed "account
+    already exists" for an account that had, in fact, just been created
+    successfully. Backgrounding the send fixes both: the page responds
+    almost instantly, and email delivery (or a real failure, logged to the
+    server console) happens off the critical path. Fails silently from the
+    caller's perspective by design — a booking or signup should never be
+    blocked just because an email didn't go out."""
+    threading.Thread(
+        target=_send_email_background,
+        args=(to_email, subject, html_body),
+        daemon=True,
+    ).start()
+    return True
 
 
 def email_wrapper(inner_html):
@@ -869,7 +889,7 @@ def notify_signup(name, email):
     )
     send_email(
         OWNER_EMAIL,
-        "New account created",
+        f"New account created - {name}",
         email_wrapper(f"<p>{name} ({email}) just created an account.</p>"),
     )
 
@@ -888,7 +908,7 @@ def notify_booking(name, email, service, appt_date_iso, appt_time):
     )
     send_email(
         OWNER_EMAIL,
-        "New booking",
+        f"New booking - {name} - {details}",
         email_wrapper(f"<p>{name} booked an appointment.</p><p><strong>{details}</strong></p>"),
     )
 
@@ -908,7 +928,7 @@ def notify_cancel(name, email, service, appt_date_iso, appt_time, by_owner=False
     who = "The owner" if by_owner else name
     send_email(
         OWNER_EMAIL,
-        "Appointment cancelled",
+        f"Appointment cancelled - {name} - {details}",
         email_wrapper(f"<p>{who} cancelled {name}'s appointment.</p><p><strong>{details}</strong></p>"),
     )
 
@@ -929,7 +949,7 @@ def notify_reschedule(name, email, service, old_date_iso, old_time, new_date_iso
     who = "The owner" if by_owner else name
     send_email(
         OWNER_EMAIL,
-        "Appointment rescheduled",
+        f"Appointment rescheduled - {name} - {new_details}",
         email_wrapper(
             f"<p>{who} rescheduled {name}'s appointment.</p>"
             f"<p>Old time: {old_details}<br>New time: <strong>{new_details}</strong></p>"
@@ -2577,7 +2597,8 @@ def render_login():
                             st.query_params["page"] = "Your Appointments"
                             st.rerun()
                         else:
-                            user = verify_login(email, password)
+                            with st.spinner("Logging in..."):
+                                user = verify_login(email, password)
                             if user:
                                 user["is_admin"] = False
                                 st.session_state.user = user
@@ -2609,7 +2630,8 @@ def render_login():
                         elif email.strip().lower() == ADMIN_EMAIL.lower():
                             st.error("This email is reserved. Please use a different one.")
                         else:
-                            ok, msg = create_user(name, email, phone, password)
+                            with st.spinner("Creating your account..."):
+                                ok, msg = create_user(name, email, phone, password)
                             if ok:
                                 user = verify_login(email, password)
                                 user["is_admin"] = False
@@ -2740,7 +2762,8 @@ def render_book_now():
                     if appt_time is None:
                         st.error("That day is fully booked - please choose another date.")
                     else:
-                        ok, msg = create_appointment(user["id"], service_key, appt_date, appt_time, notes or "")
+                        with st.spinner("Booking your appointment..."):
+                            ok, msg = create_appointment(user["id"], service_key, appt_date, appt_time, notes or "")
                         if ok:
                             st.success("Appointment booked! See it below.")
                             st.rerun()
@@ -2782,7 +2805,8 @@ def render_book_now():
                                     st.rerun()
                             with btn_b:
                                 if st.button("Cancel", key=f"cancel_{appt_id}"):
-                                    cancel_appointment(appt_id, user["id"])
+                                    with st.spinner("Cancelling..."):
+                                        cancel_appointment(appt_id, user["id"])
                                     st.rerun()
 
                         if st.session_state.editing_appt_id == appt_id:
@@ -2834,7 +2858,8 @@ def render_book_now():
                                     if new_time is None:
                                         st.error("That day is fully booked - please choose another date.")
                                     else:
-                                        ok, msg = reschedule_appointment(appt_id, user["id"], new_date, new_time)
+                                        with st.spinner("Saving new time..."):
+                                            ok, msg = reschedule_appointment(appt_id, user["id"], new_date, new_time)
                                         if ok:
                                             st.session_state.editing_appt_id = None
                                             st.success("Appointment updated.")
@@ -3017,7 +3042,8 @@ def render_my_schedule():
                             st.rerun()
                     with btn_b:
                         if st.button("Cancel", key=f"admin_cancel_{appt_id}"):
-                            admin_cancel_appointment(appt_id)
+                            with st.spinner("Cancelling..."):
+                                admin_cancel_appointment(appt_id)
                             st.rerun()
 
                 if st.session_state.admin_editing_appt_id == appt_id:
@@ -3068,7 +3094,8 @@ def render_my_schedule():
                             if new_time is None:
                                 st.error("That day is fully booked - please choose another date.")
                             else:
-                                ok, msg = admin_reschedule_appointment(appt_id, new_date, new_time)
+                                with st.spinner("Saving new time..."):
+                                    ok, msg = admin_reschedule_appointment(appt_id, new_date, new_time)
                                 if ok:
                                     st.session_state.admin_editing_appt_id = None
                                     st.success("Appointment updated.")
