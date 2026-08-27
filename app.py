@@ -115,6 +115,7 @@ def get_db_secret(key):
         return ""
 
 
+@st.cache_resource
 def get_conn():
     database_url = get_db_secret("TURSO_DATABASE_URL")
     auth_token = get_db_secret("TURSO_AUTH_TOKEN")
