@@ -276,6 +276,27 @@ def init_db():
     except Exception as e:
         if "duplicate column" not in str(e).lower():
             raise
+    # Owner-controlled loyalty punch card: the owner manually checks off
+    # each haircut (Customer Punches tab) instead of it being counted
+    # automatically just for being booked. loyalty_checked marks whether
+    # THIS appointment has already been punched, so it drops off the
+    # "needs a check" list once handled.
+    try:
+        conn.execute("ALTER TABLE appointments ADD COLUMN loyalty_checked INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+    except Exception as e:
+        if "duplicate column" not in str(e).lower():
+            raise
+    for stmt in (
+        "ALTER TABLE users ADD COLUMN loyalty_punches INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN loyalty_free_earned INTEGER NOT NULL DEFAULT 0",
+    ):
+        try:
+            conn.execute(stmt)
+            conn.commit()
+        except Exception as e:
+            if "duplicate column" not in str(e).lower():
+                raise
     # Every Style-AI recommendation a customer gets, so the owner can look
     # back at what was said to each person about their hair (Customers tab).
     conn.execute(
@@ -493,6 +514,7 @@ def create_appointment(user_id, service_key, appt_date, appt_time, notes, credit
     conn.commit()
     _get_booked_slots_cached.clear()
     _get_appointments_cached.clear()
+    _get_unchecked_appointments_cached.clear()
     user_row = conn.execute("SELECT name, email FROM users WHERE id = ?", (user_id,)).fetchone()
     if user_row:
         notify_booking(user_row[0], user_row[1], service["label"], appt_date.isoformat(), appt_time)
@@ -511,22 +533,70 @@ def get_referral_code(user_id):
     return row[0] if row else None
 
 
-LOYALTY_CYCLE = 6  # every 6th completed cut is free
+LOYALTY_CYCLE = 3  # every 3 checked cuts earns a free 4th
 
 
-def get_loyalty_progress(user_id):
-    """Loyalty punch card is purely informational (no separate redemption
-    tracking/new table) - it's computed straight from appointment history:
-    every past Confirmed appointment counts as one punch. Returns
-    (completed_cuts, punches_in_current_cycle, free_cuts_earned)."""
+def get_loyalty_state(user_id):
+    """Owner-controlled loyalty: punches only increase when the owner
+    manually checks off a haircut (see mark_loyalty_checked below), not
+    just for being booked. Returns (punches_in_current_cycle, free_cuts_earned)."""
     conn = get_conn()
-    today_iso = date.today().isoformat()
     row = conn.execute(
-        "SELECT COUNT(*) FROM appointments WHERE user_id = ? AND status = 'Confirmed' AND appt_date < ?",
-        (user_id, today_iso),
+        "SELECT loyalty_punches, loyalty_free_earned FROM users WHERE id = ?", (user_id,)
     ).fetchone()
-    completed = row[0] if row else 0
-    return completed, completed % LOYALTY_CYCLE, completed // LOYALTY_CYCLE
+    return (row[0], row[1]) if row else (0, 0)
+
+
+@st.cache_data(ttl=5)
+def _get_unchecked_appointments_cached():
+    """Every Confirmed appointment (scheduled or already past) the owner
+    hasn't punched yet — feeds the Customer Punches tab."""
+    conn = get_conn()
+    rows = conn.execute(
+        """
+        SELECT a.id, a.service, a.price, a.appt_date, a.appt_time, u.id, u.name
+        FROM appointments a
+        JOIN users u ON u.id = a.user_id
+        WHERE a.status = 'Confirmed' AND a.loyalty_checked = 0
+        ORDER BY a.appt_date ASC, a.appt_time ASC
+        """
+    ).fetchall()
+    return rows
+
+
+def get_unchecked_appointments():
+    return _get_unchecked_appointments_cached()
+
+
+def mark_loyalty_checked(appt_id, user_id):
+    """Owner taps the check on one appointment: marks it punched, bumps
+    that customer's punch count, and — every LOYALTY_CYCLE punches — banks
+    a free cut and emails the customer about it."""
+    conn = get_conn()
+    conn.execute("UPDATE appointments SET loyalty_checked = 1 WHERE id = ?", (appt_id,))
+    conn.execute("UPDATE users SET loyalty_punches = loyalty_punches + 1 WHERE id = ?", (user_id,))
+    conn.commit()
+    row = conn.execute("SELECT loyalty_punches, name, email FROM users WHERE id = ?", (user_id,)).fetchone()
+    _get_unchecked_appointments_cached.clear()
+    if row and row[0] >= LOYALTY_CYCLE:
+        conn.execute(
+            "UPDATE users SET loyalty_punches = 0, loyalty_free_earned = loyalty_free_earned + 1 WHERE id = ?",
+            (user_id,),
+        )
+        conn.commit()
+        name, email = row[1], row[2]
+        send_email(
+            email,
+            "Your next haircut is FREE! 🎉",
+            email_wrapper(
+                f"<p>Hey {name},</p>"
+                f"<p>You just hit {LOYALTY_CYCLE} cuts on your loyalty punch card - "
+                "your next haircut is on the house. Just mention it next time you're in the chair.</p>"
+                "<p>- FADEDFORLESS</p>"
+            ),
+        )
+        return True
+    return False
 
 
 @st.cache_data(ttl=5)
@@ -560,6 +630,7 @@ def cancel_appointment(appt_id, user_id):
     _get_booked_slots_cached.clear()
     _get_appointments_cached.clear()
     _get_all_appointments_cached.clear()
+    _get_unchecked_appointments_cached.clear()
     if row:
         service, appt_date, appt_time, name, email = row
         notify_cancel(name, email, service, appt_date, appt_time, by_owner=False)
@@ -588,6 +659,7 @@ def reschedule_appointment(appt_id, user_id, new_date, new_time):
     _get_booked_slots_cached.clear()
     _get_appointments_cached.clear()
     _get_all_appointments_cached.clear()
+    _get_unchecked_appointments_cached.clear()
     if old_row:
         service, old_date, old_time, name, email = old_row
         notify_reschedule(name, email, service, old_date, old_time, new_date.isoformat(), new_time, by_owner=False)
@@ -611,6 +683,7 @@ def admin_cancel_appointment(appt_id):
     _get_booked_slots_cached.clear()
     _get_appointments_cached.clear()
     _get_all_appointments_cached.clear()
+    _get_unchecked_appointments_cached.clear()
     if row:
         service, appt_date, appt_time, name, email = row
         notify_cancel(name, email, service, appt_date, appt_time, by_owner=True)
@@ -638,6 +711,7 @@ def admin_reschedule_appointment(appt_id, new_date, new_time):
     _get_booked_slots_cached.clear()
     _get_appointments_cached.clear()
     _get_all_appointments_cached.clear()
+    _get_unchecked_appointments_cached.clear()
     if old_row:
         service, old_date, old_time, name, email = old_row
         notify_reschedule(name, email, service, old_date, old_time, new_date.isoformat(), new_time, by_owner=True)
@@ -1118,6 +1192,50 @@ def build_ics_bytes(summary, appt_date_iso, appt_time, price, description=""):
     return ics.encode("utf-8")
 
 
+def build_ics_bytes_multi(events):
+    """One .ics file containing MANY appointments as separate VEVENTs — for
+    the owner's 'Add Whole Calendar' button, so they can import every
+    upcoming booking into their calendar app in one shot instead of one
+    file per appointment. `events` is a list of
+    (summary, appt_date_iso, appt_time, price, description) tuples. Same
+    string-formatting approach as build_ics_bytes, so still effectively
+    free performance-wise even for a long list."""
+    def esc(text):
+        return text.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
+
+    dtstamp = datetime.now().strftime("%Y%m%dT%H%M%SZ")
+    vevents = []
+    for summary, appt_date_iso, appt_time, price, description in events:
+        try:
+            start_dt = datetime.strptime(f"{appt_date_iso} {appt_time}", "%Y-%m-%d %I:%M %p")
+        except ValueError:
+            continue
+        duration = PRICE_TO_DURATION_MINUTES.get(price, 45)
+        end_dt = start_dt + timedelta(minutes=duration)
+        uid = f"{appt_date_iso}-{appt_time}-{random.randint(1000,9999)}@fadedforless".replace(" ", "")
+        vevents.append(
+            "BEGIN:VEVENT\r\n"
+            f"UID:{uid}\r\n"
+            f"DTSTAMP:{dtstamp}\r\n"
+            f"DTSTART:{start_dt.strftime('%Y%m%dT%H%M%S')}\r\n"
+            f"DTEND:{end_dt.strftime('%Y%m%dT%H%M%S')}\r\n"
+            f"SUMMARY:{esc(summary)}\r\n"
+            f"DESCRIPTION:{esc(description)}\r\n"
+            "LOCATION:FADEDFORLESS Barbershop\r\n"
+            "END:VEVENT\r\n"
+        )
+
+    ics = (
+        "BEGIN:VCALENDAR\r\n"
+        "VERSION:2.0\r\n"
+        "PRODID:-//FADEDFORLESS//Booking//EN\r\n"
+        "CALSCALE:GREGORIAN\r\n"
+        + "".join(vevents)
+        + "END:VCALENDAR\r\n"
+    )
+    return ics.encode("utf-8")
+
+
 def notify_signup(name, email, referral_applied=False):
     referral_note = (
         "<p style=\"color:#F1D98B;\"><strong>You've also got $10 in credit</strong> from your "
@@ -1214,14 +1332,14 @@ def notify_reschedule(name, email, service, old_date_iso, old_time, new_date_iso
 if "user" not in st.session_state:
     st.session_state.user = None
 
-BASE_PAGES = ["Home", "About Me", "Pricing", "What You Get", "Book Now"]
+BASE_PAGES = ["Home", "About Me", "Pricing", "Book Now"]
 IS_ADMIN = bool(st.session_state.user and st.session_state.user.get("is_admin"))
 IS_CUSTOMER = bool(st.session_state.user and not IS_ADMIN)
 AUTH_PAGES = [] if st.session_state.user else ["Log In"]
 VALID_PAGES = (
     BASE_PAGES
     + AUTH_PAGES
-    + (["Your Appointments", "Customers", "Style", "Settings"] if IS_ADMIN else [])
+    + (["Your Appointments", "Customer Punches", "Customers", "Style", "Settings"] if IS_ADMIN else [])
     + (["Style", "Rewards", "Settings"] if IS_CUSTOMER else [])
 )
 
@@ -2632,7 +2750,7 @@ with st.container(key="site_navbar"):
     # pressed, in which case they stack into a vertical dropdown.
     n_pages = len(VALID_PAGES)
     links_key = "nav_links_open" if st.session_state.mobile_menu_open else "nav_links_closed"
-    NAV_LABELS = {"Your Appointments": "Your Appts", "Style": "AI Consult"}
+    NAV_LABELS = {"Your Appointments": "Your Appts", "Style": "AI Consult", "Customer Punches": "Punches"}
     with st.container(key=links_key):
         link_cols = st.columns([1] * n_pages, vertical_alignment="center")
         for i, page_name in enumerate(VALID_PAGES):
@@ -2932,120 +3050,6 @@ def render_pricing():
 
     st.markdown("<div style='height:20px;'></div>", unsafe_allow_html=True)
 
-# ----------------------------------------------------------------------------
-# WHAT YOU GET PAGE
-# ----------------------------------------------------------------------------
-def render_what_you_get():
-    raw_html(
-        """
-        <div class="section" style="padding-bottom:10px;">
-            <div class="booking-head">
-                <div class="eyebrow" style="justify-content:center;">What You Get</div>
-                <h2 class="section-title">The $15 Full Haircut, step by step</h2>
-                <div class="divider" style="margin-left:auto; margin-right:auto;"></div>
-                <p class="section-sub" style="margin:14px auto 0 auto;">
-                    Scroll down to see exactly what's included in every full haircut -
-                    no shortcuts, no upsells.
-                </p>
-            </div>
-        </div>
-        """
-    )
-
-    WYG_STEPS = [
-        {
-            "num": "Step 1",
-            "title": "Fade",
-            "img": STYLE_SHOWCASE[0]["img"],
-            "desc": "A clean, blended fade built around your hair type and face shape - "
-                    "low, mid, or high, whatever suits you best.",
-        },
-        {
-            "num": "Step 2",
-            "title": "Trim",
-            "img": IMG_STRIP_2,
-            "desc": "The top gets shaped and trimmed to length, keeping everything even "
-                    "and blending seamlessly into the fade underneath.",
-        },
-        {
-            "num": "Step 3",
-            "title": "Cleanup",
-            "img": STYLE_SHOWCASE[3]["img"],
-            "desc": "Sharp lineup around the edges, neckline, and hairline for that fresh, "
-                    "just-left-the-shop look.",
-        },
-        {
-            "num": "Step 4",
-            "title": "Finished",
-            "img": IMG_PRICE_15,
-            "desc": "A complete, polished cut - checked over and touched up before you "
-                    "leave the chair.",
-        },
-    ]
-
-    steps_html = "".join(
-        f"""
-        <div class="wyg-step">
-            <div class="wyg-step-img" style="background-image:url('{s['img']}');"></div>
-            <div class="wyg-step-body">
-                <div class="wyg-step-num">{s['num']}</div>
-                <div class="wyg-step-title">{s['title']} <span class="check">✓</span></div>
-                <p class="wyg-step-desc">{s['desc']}</p>
-            </div>
-        </div>
-        """
-        for s in WYG_STEPS
-    )
-    raw_html(
-        f"""
-        <div class="section section-tight" style="padding-top:10px;">
-            <div class="wyg-steps">
-                {steps_html}
-            </div>
-        </div>
-        """
-    )
-
-    # Scroll-triggered reveal: this small iframe's JS reaches out to the
-    # *parent* document (same-origin, so this is safe) and watches each
-    # .wyg-step card individually with an IntersectionObserver, so each one
-    # fades in right as the user scrolls to it - not all at once.
-    components.html(
-        """
-        <script>
-        (function() {
-            const doc = window.parent.document;
-            const steps = Array.from(doc.querySelectorAll('.wyg-step'));
-            if (!steps.length || steps[0].dataset.wygBound) return;
-            steps.forEach(el => { el.dataset.wygBound = "1"; });
-
-            const observer = new IntersectionObserver((entries) => {
-                entries.forEach((entry) => {
-                    if (entry.isIntersecting) {
-                        entry.target.classList.add('visible');
-                        observer.unobserve(entry.target);
-                    }
-                });
-            }, { threshold: 0.25, root: null, rootMargin: "0px 0px -60px 0px" });
-
-            steps.forEach(el => observer.observe(el));
-        })();
-        </script>
-        """,
-        height=0,
-    )
-
-    st.markdown("<div style='height:20px;'></div>", unsafe_allow_html=True)
-
-    with st.container(key="wyg_cta"):
-        c1, c2, _sp = st.columns([1, 1, 3])
-        with c1:
-            st.button("Book the $15 Cut", key="wyg_book_now", type="primary", on_click=go_to, args=("Book Now",))
-        with c2:
-            st.button("See Full Pricing", key="wyg_view_pricing", on_click=go_to, args=("Pricing",))
-
-    st.markdown("<div style='height:60px;'></div>", unsafe_allow_html=True)
-
 
 def render_login():
     if st.session_state.user:
@@ -3294,10 +3298,6 @@ def render_book_now():
                             disabled=True,
                             key="booking_time_full",
                         )
-                if day_slots:
-                    raw_html(
-                        f'<div class="slots-caption">{len(available_times)} of {len(day_slots)} slots open that day</div>'
-                    )
 
                 raw_html('<div class="booking-step-label"><span class="step-num">3</span>Anything We Should Know?</div>')
                 notes = st.text_area("Notes (optional)", placeholder="Anything the barber should know", key="booking_notes", label_visibility="collapsed")
@@ -3512,7 +3512,9 @@ def render_rewards():
     left, mid, right = st.columns([1, 2.2, 1])
     with mid:
         # ---------- LOYALTY PUNCH CARD ----------
-        completed, punches, free_earned = get_loyalty_progress(user["id"])
+        # Owner-controlled: punches only move when the owner checks off a
+        # haircut in the Customer Punches tab, not automatically at booking.
+        punches, free_earned = get_loyalty_state(user["id"])
         punch_html = "".join(
             f'<div class="punch{" filled" if i < punches else ""}">{"✓" if i < punches else ""}</div>'
             for i in range(LOYALTY_CYCLE)
@@ -3534,7 +3536,7 @@ def render_rewards():
             f"""
             <div class="rewards-card">
                 <div class="rewards-card-title">Loyalty Punch Card</div>
-                <div class="rewards-card-sub">Every {LOYALTY_CYCLE}th cut is on us. {completed} cut{'s' if completed != 1 else ''} completed so far.</div>
+                <div class="rewards-card-sub">Every {LOYALTY_CYCLE} cuts, the next one is on us. Your barber checks off each visit.</div>
                 <div class="punch-row">{punch_html}</div>
                 {progress_html}
             </div>
@@ -3618,6 +3620,29 @@ def render_my_schedule():
     with mid:
         all_appts = get_all_appointments()
         active_appts = [a for a in all_appts if a[6] == "Confirmed"]
+
+        today_iso = date.today().isoformat()
+        upcoming_for_export = [a for a in active_appts if a[3] >= today_iso]
+        if upcoming_for_export:
+            calendar_events = [
+                (
+                    f"{a[1]} - {a[7]} - FADEDFORLESS",
+                    a[3],
+                    a[4],
+                    a[2],
+                    f"Customer: {a[7]} ({a[8] or a[9] or ''})",
+                )
+                for a in upcoming_for_export
+            ]
+            st.download_button(
+                f"📅 Add Whole Calendar to Your Calendar ({len(calendar_events)} appointments)",
+                data=build_ics_bytes_multi(calendar_events),
+                file_name=f"fadedforless-full-schedule-{today_iso}.ics",
+                mime="text/calendar",
+                key="admin_ics_all",
+                use_container_width=True,
+            )
+            st.markdown("<div style='height:16px;'></div>", unsafe_allow_html=True)
 
         by_date = {}
         for appt in active_appts:
@@ -3714,18 +3739,21 @@ def render_my_schedule():
             for appt_id, service, price, appt_date_str, appt_time_str, notes, status, cust_name, cust_phone, cust_email in upcoming:
                 pretty_date = datetime.strptime(appt_date_str, "%Y-%m-%d").strftime("%b %d, %Y")
                 contact = cust_phone or cust_email or ""
-                raw_html(
-                    f"""
-                    <div class="admin-appt-row">
-                        <div class="admin-appt-time">{pretty_date}<br>{appt_time_str}</div>
-                        <div style="flex:1; min-width:160px;">
-                            <div class="admin-appt-cust">{cust_name}</div>
-                            <div class="admin-appt-service"><span class="gold-tag">{service} · {price}{" · " + contact if contact else ""}</span></div>
+                # Collapsed by default — tap to expand and reveal the
+                # actions, instead of every row showing 3 buttons at once
+                # (which made a long list hard to scan/use).
+                with st.expander(f"{pretty_date} · {appt_time_str} — {cust_name} ({service})"):
+                    raw_html(
+                        f"""
+                        <div class="admin-appt-row" style="margin-bottom:10px;">
+                            <div class="admin-appt-time">{pretty_date}<br>{appt_time_str}</div>
+                            <div style="flex:1; min-width:160px;">
+                                <div class="admin-appt-cust">{cust_name}</div>
+                                <div class="admin-appt-service"><span class="gold-tag">{service} · {price}{" · " + contact if contact else ""}</span></div>
+                            </div>
                         </div>
-                    </div>
-                    """
-                )
-                with st.container(key=f"admin_appt_actions_{appt_id}"):
+                        """
+                    )
                     btn_a, btn_b, btn_c = st.columns(3)
                     with btn_a:
                         if st.button("Change Time", key=f"admin_change_{appt_id}"):
@@ -3754,74 +3782,131 @@ def render_my_schedule():
                             use_container_width=True,
                         )
 
-                if st.session_state.admin_editing_appt_id == appt_id:
-                    # Not st.form — same reasoning as the customer reschedule:
-                    # the time list must refresh the instant the date changes.
-                    with st.container(key=f"admin_reschedule_widget_{appt_id}"):
-                        st.markdown(f"**Reschedule {cust_name} - {service}**")
-                        rc_a, rc_b = st.columns(2)
-                        with rc_a:
-                            new_date = st.date_input(
-                                "New date",
-                                min_value=date.today(),
-                                max_value=date.today() + timedelta(days=60),
-                                value=datetime.strptime(appt_date_str, "%Y-%m-%d").date(),
-                                key=f"admin_reschedule_date_{appt_id}",
-                            )
-                        with rc_b:
-                            booked_times = get_booked_times(new_date.isoformat(), exclude_appt_id=appt_id)
-                            available_times = [t for t in time_slots_for_date(new_date) if t not in booked_times]
-                            if new_date.isoformat() == appt_date_str and appt_time_str not in available_times:
-                                available_times = [appt_time_str] + available_times
-                            if available_times:
-                                current_idx = (
-                                    available_times.index(appt_time_str)
-                                    if appt_time_str in available_times
-                                    else 0
+                    if st.session_state.admin_editing_appt_id == appt_id:
+                        # Not st.form — same reasoning as the customer reschedule:
+                        # the time list must refresh the instant the date changes.
+                        with st.container(key=f"admin_reschedule_widget_{appt_id}"):
+                            st.markdown(f"**Reschedule {cust_name} - {service}**")
+                            rc_a, rc_b = st.columns(2)
+                            with rc_a:
+                                new_date = st.date_input(
+                                    "New date",
+                                    min_value=date.today(),
+                                    max_value=date.today() + timedelta(days=60),
+                                    value=datetime.strptime(appt_date_str, "%Y-%m-%d").date(),
+                                    key=f"admin_reschedule_date_{appt_id}",
                                 )
-                                new_time = st.selectbox(
-                                    "New time",
-                                    available_times,
-                                    index=current_idx,
-                                    key=f"admin_reschedule_time_{appt_id}",
-                                )
-                            else:
-                                new_time = None
-                                st.selectbox(
-                                    "New time",
-                                    ["Fully booked - pick another day"],
-                                    disabled=True,
-                                    key=f"admin_reschedule_time_full_{appt_id}",
-                                )
-                        save_col, cancel_col = st.columns(2)
-                        with save_col:
-                            save_clicked = st.button("Save New Time", key=f"admin_reschedule_save_{appt_id}")
-                        with cancel_col:
-                            cancel_clicked = st.button("Nevermind", key=f"admin_reschedule_cancel_{appt_id}")
-                        if save_clicked:
-                            if new_time is None:
-                                st.error("That day is fully booked - please choose another date.")
-                            else:
-                                with st.spinner("Saving new time..."):
-                                    ok, msg = admin_reschedule_appointment(appt_id, new_date, new_time)
-                                if ok:
-                                    st.session_state.admin_editing_appt_id = None
-                                    st.success("Appointment updated.")
-                                    st.rerun()
+                            with rc_b:
+                                booked_times = get_booked_times(new_date.isoformat(), exclude_appt_id=appt_id)
+                                available_times = [t for t in time_slots_for_date(new_date) if t not in booked_times]
+                                if new_date.isoformat() == appt_date_str and appt_time_str not in available_times:
+                                    available_times = [appt_time_str] + available_times
+                                if available_times:
+                                    current_idx = (
+                                        available_times.index(appt_time_str)
+                                        if appt_time_str in available_times
+                                        else 0
+                                    )
+                                    new_time = st.selectbox(
+                                        "New time",
+                                        available_times,
+                                        index=current_idx,
+                                        key=f"admin_reschedule_time_{appt_id}",
+                                    )
                                 else:
-                                    st.error(msg)
-                        if cancel_clicked:
-                            st.session_state.admin_editing_appt_id = None
-                            st.rerun()
+                                    new_time = None
+                                    st.selectbox(
+                                        "New time",
+                                        ["Fully booked - pick another day"],
+                                        disabled=True,
+                                        key=f"admin_reschedule_time_full_{appt_id}",
+                                    )
+                            save_col, cancel_col = st.columns(2)
+                            with save_col:
+                                save_clicked = st.button("Save New Time", key=f"admin_reschedule_save_{appt_id}")
+                            with cancel_col:
+                                cancel_clicked = st.button("Nevermind", key=f"admin_reschedule_cancel_{appt_id}")
+                            if save_clicked:
+                                if new_time is None:
+                                    st.error("That day is fully booked - please choose another date.")
+                                else:
+                                    with st.spinner("Saving new time..."):
+                                        ok, msg = admin_reschedule_appointment(appt_id, new_date, new_time)
+                                    if ok:
+                                        st.session_state.admin_editing_appt_id = None
+                                        st.success("Appointment updated.")
+                                        st.rerun()
+                                    else:
+                                        st.error(msg)
+                            if cancel_clicked:
+                                st.session_state.admin_editing_appt_id = None
+                                st.rerun()
 
     st.markdown("<div style='height:60px;'></div>", unsafe_allow_html=True)
 
 
 # ----------------------------------------------------------------------------
-# CUSTOMERS PAGE (admin/owner only) — every registered customer, their
-# contact info, and their haircut history at a glance.
+# CUSTOMER PUNCHES PAGE (admin/owner only) — every scheduled or past haircut
+# the owner hasn't punched yet on the loyalty card. Checking one off bumps
+# that customer's loyalty count and drops it off this list.
 # ----------------------------------------------------------------------------
-def render_customers():
+def render_admin_punches():
+    user = st.session_state.user
+    if not user or not user.get("is_admin"):
+        st.warning("This page is only available to the shop owner.")
+        return
+
+    raw_html(
+        """
+        <div class="section" style="padding-bottom:20px;">
+            <div class="booking-head">
+                <div class="eyebrow" style="justify-content:center;">Owner View</div>
+                <h2 class="section-title">Customer Punches</h2>
+                <div class="divider" style="margin-left:auto; margin-right:auto;"></div>
+                <p class="section-sub" style="margin:14px auto 0 auto;">
+                    Check off a haircut once it's done to add it to that customer's loyalty card.
+                    Every 3 punches earns their 4th cut free.
+                </p>
+            </div>
+        </div>
+        """
+    )
+
+    left, mid, right = st.columns([1, 2.2, 1])
+    with mid:
+        unchecked = get_unchecked_appointments()
+        if not unchecked:
+            raw_html(
+                """
+                <div class="appt-card" style="flex-direction:column; align-items:center; text-align:center; gap:6px; padding:36px 24px;">
+                    <div class="appt-service">You're all caught up! ✓</div>
+                    <p style="margin:6px 0 4px 0; color:#847f72;">No haircuts waiting to be checked off.</p>
+                </div>
+                """
+            )
+        else:
+            for appt_id, service, price, appt_date_str, appt_time_str, cust_user_id, cust_name in unchecked:
+                pretty_date = datetime.strptime(appt_date_str, "%Y-%m-%d").strftime("%b %d, %Y")
+                raw_html(
+                    f"""
+                    <div class="appt-card">
+                        <div>
+                            <div class="appt-service">{cust_name} — {service}</div>
+                            <div class="appt-meta"><span class="gold-tag">{pretty_date} at {appt_time_str} · {price}</span></div>
+                        </div>
+                    </div>
+                    """
+                )
+                if st.button("✓ Check This Off", key=f"punch_{appt_id}", use_container_width=True):
+                    reward_hit = mark_loyalty_checked(appt_id, cust_user_id)
+                    if reward_hit:
+                        st.success(f"{cust_name} just earned a free haircut! An email went out to them.")
+                    st.rerun()
+
+    st.markdown("<div style='height:60px;'></div>", unsafe_allow_html=True)
+
+
+
     user = st.session_state.user
     if not user or not user.get("is_admin"):
         st.warning("This page is only available to the shop owner.")
@@ -4287,14 +4372,14 @@ elif current_page == "About Me":
     render_about()
 elif current_page == "Pricing":
     render_pricing()
-elif current_page == "What You Get":
-    render_what_you_get()
 elif current_page == "Book Now":
     render_book_now()
 elif current_page == "Log In":
     render_login()
 elif current_page == "Your Appointments":
     render_my_schedule()
+elif current_page == "Customer Punches":
+    render_admin_punches()
 elif current_page == "Customers":
     render_customers()
 elif current_page == "Settings":
