@@ -4,6 +4,8 @@ import libsql
 import hashlib
 import os
 import re
+import random
+import string
 import base64
 import calendar as cal_module
 import smtplib
@@ -92,6 +94,10 @@ SERVICES = {
     "Full Haircut - $15 (1 hour)": {"label": "Full Haircut (Fade + Trim)", "price": "$15", "duration": "1 hour"},
 }
 
+# Cents version of each service price, used for referral-credit math (the
+# "price" strings above stay as the display labels everywhere else).
+SERVICE_PRICE_CENTS = {k: int(round(float(v["price"].replace("$", "")) * 100)) for k, v in SERVICES.items()}
+
 # ----------------------------------------------------------------------------
 # DATABASE
 # ----------------------------------------------------------------------------
@@ -115,8 +121,7 @@ def get_db_secret(key):
         return ""
 
 
-@st.cache_resource
-def get_conn():
+def _raw_connect():
     database_url = get_db_secret("TURSO_DATABASE_URL")
     auth_token = get_db_secret("TURSO_AUTH_TOKEN")
     if not database_url or not auth_token:
@@ -125,8 +130,45 @@ def get_conn():
             "are missing from Secrets. Add them in Settings > Secrets, then reload."
         )
         st.stop()
-    conn = libsql.connect(database=database_url, auth_token=auth_token)
-    return conn
+    return libsql.connect(database=database_url, auth_token=auth_token)
+
+
+class _ResilientConn:
+    """Wraps the real libsql connection and transparently reconnects+retries
+    ONCE if a query fails. get_conn() is cached with @st.cache_resource, so
+    the whole app was sharing one raw connection for its entire lifetime -
+    great for speed, but Turso can drop an idle connection after a quiet
+    stretch (very common on Streamlit Cloud, which sleeps between
+    visitors), and there was no way to recover from that: the next query
+    ANYWHERE in the app - like get_all_appointments() on the schedule page -
+    would just crash. Only .execute() and .commit() are used on `conn`
+    anywhere in this file, so wrapping just those two methods is a drop-in
+    fix; nothing else in the app has to change."""
+    def __init__(self, connect_fn):
+        self._connect_fn = connect_fn
+        self._raw = connect_fn()
+
+    def _reconnect(self):
+        self._raw = self._connect_fn()
+
+    def execute(self, *args, **kwargs):
+        try:
+            return self._raw.execute(*args, **kwargs)
+        except Exception:
+            self._reconnect()
+            return self._raw.execute(*args, **kwargs)
+
+    def commit(self):
+        try:
+            return self._raw.commit()
+        except Exception:
+            self._reconnect()
+            return self._raw.commit()
+
+
+@st.cache_resource
+def get_conn():
+    return _ResilientConn(_raw_connect)
 
 
 def check_turso_status():
@@ -185,6 +227,21 @@ def init_db():
         # same exception class sqlite3 does, so match on the message instead.
         if "duplicate column" not in str(e).lower():
             raise
+    # Referral program: every user gets a unique shareable code, plus a
+    # credit balance (in cents, to avoid float rounding) that's earned by
+    # referring friends and spent at booking time. referred_by records which
+    # code a user signed up with, purely for the owner's own records.
+    for stmt in (
+        "ALTER TABLE users ADD COLUMN referral_code TEXT",
+        "ALTER TABLE users ADD COLUMN credit_cents INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN referred_by TEXT",
+    ):
+        try:
+            conn.execute(stmt)
+            conn.commit()
+        except Exception as e:
+            if "duplicate column" not in str(e).lower():
+                raise
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS appointments (
@@ -206,6 +263,15 @@ def init_db():
     # so the reminder_worker.py cron job never double-sends one.
     try:
         conn.execute("ALTER TABLE appointments ADD COLUMN reminder_sent INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+    except Exception as e:
+        if "duplicate column" not in str(e).lower():
+            raise
+    # How much referral credit (in cents) was applied to this specific
+    # booking — kept per-appointment so the owner can see exactly what was
+    # honored at checkout, even after the customer's balance has moved on.
+    try:
+        conn.execute("ALTER TABLE appointments ADD COLUMN credit_applied_cents INTEGER NOT NULL DEFAULT 0")
         conn.commit()
     except Exception as e:
         if "duplicate column" not in str(e).lower():
@@ -250,23 +316,82 @@ def hash_password(password, salt=None):
     return salt, pw_hash
 
 
-def create_user(name, email, phone, password):
+REFERRAL_BONUS_CENTS = 1000  # $10 credit for both the new signup and the friend who referred them
+
+
+def _generate_referral_code(name):
+    """4 letters from the name + 4 random digits, e.g. 'ALEX4821'. Retries
+    on the rare collision since it's stored as UNIQUE-ish (checked by hand
+    below, since ALTER TABLE can't easily add a UNIQUE constraint after the
+    fact on every DB backend)."""
+    conn = get_conn()
+    base = "".join(ch for ch in name.upper() if ch.isalpha())[:4] or "CUT"
+    for _ in range(10):
+        code = f"{base}{random.randint(1000, 9999)}"
+        exists = conn.execute("SELECT id FROM users WHERE referral_code = ?", (code,)).fetchone()
+        if not exists:
+            return code
+    return f"{base}{random.randint(10000, 99999)}"
+
+
+def format_cents(cents):
+    return f"${cents / 100:.2f}".rstrip("0").rstrip(".") if cents % 100 == 0 else f"${cents / 100:.2f}"
+
+
+def create_user(name, email, phone, password, referral_code_used=None):
     conn = get_conn()
     salt, pw_hash = hash_password(password)
+    clean_name = name.strip()
+    clean_email = email.strip().lower()
+    my_code = _generate_referral_code(clean_name)
     try:
         conn.execute(
-            "INSERT INTO users (name, email, phone, salt, password_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (name.strip(), email.strip().lower(), phone.strip(), salt, pw_hash, datetime.now().isoformat()),
+            "INSERT INTO users (name, email, phone, salt, password_hash, created_at, referral_code) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (clean_name, clean_email, phone.strip(), salt, pw_hash, datetime.now().isoformat(), my_code),
         )
         conn.commit()
-        notify_signup(name.strip(), email.strip().lower())
-        return True, "Account created."
     except Exception as e:
         # Same reasoning as the migration catches above: match on the
         # message instead of a specific exception class.
         if "unique" in str(e).lower() or "constraint" in str(e).lower():
             return False, "An account with this email already exists."
         raise
+
+    new_user_row = conn.execute("SELECT id FROM users WHERE email = ?", (clean_email,)).fetchone()
+    new_user_id = new_user_row[0] if new_user_row else None
+
+    referral_applied = False
+    if referral_code_used and referral_code_used.strip():
+        entered = referral_code_used.strip().upper()
+        referrer = conn.execute(
+            "SELECT id, name, email FROM users WHERE referral_code = ?", (entered,)
+        ).fetchone()
+        if referrer and referrer[0] != new_user_id:
+            conn.execute(
+                "UPDATE users SET credit_cents = credit_cents + ? WHERE id = ?",
+                (REFERRAL_BONUS_CENTS, new_user_id),
+            )
+            conn.execute(
+                "UPDATE users SET credit_cents = credit_cents + ? WHERE id = ?",
+                (REFERRAL_BONUS_CENTS, referrer[0]),
+            )
+            conn.execute("UPDATE users SET referred_by = ? WHERE id = ?", (entered, new_user_id))
+            conn.commit()
+            referral_applied = True
+            send_email(
+                referrer[2],
+                "You earned $10 in referral credit!",
+                email_wrapper(
+                    f"<p>Hey {referrer[1]},</p>"
+                    f"<p>{clean_name} just signed up using your referral code - "
+                    f"you've got <strong>$10 in credit</strong> toward your next visit.</p>"
+                    "<p>- FADEDFORLESS</p>"
+                ),
+            )
+
+    notify_signup(clean_name, clean_email, referral_applied)
+    return True, "Account created."
 
 
 def verify_login(email, password):
@@ -307,27 +432,43 @@ def update_profile(user_id, email, phone, profile_pic_b64=None):
         raise
 
 
+@st.cache_data(ttl=5)
+def _get_booked_slots_cached(appt_date_iso):
+    """(appt_time, appt_id) pairs for every Confirmed appointment on a date,
+    cached briefly. The booking/reschedule pickers used to hit Turso on
+    every single script rerun (typing in Notes, tapping a service card,
+    etc. reruns the whole page) just to re-fetch the same booked list for
+    the same date - this cuts that down to one network round trip per 5
+    seconds instead of one per keystroke. Actual double-booking safety
+    still comes from the fresh check inside create_appointment /
+    reschedule_appointment at write time, so a few seconds of staleness
+    here can't cause a real conflict - worst case someone briefly sees a
+    slot as open that just got taken, and the write-time check catches it.
+    Cleared immediately on any booking/cancel/reschedule via .clear()."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT appt_time, id FROM appointments WHERE appt_date = ? AND status = 'Confirmed'",
+        (appt_date_iso,),
+    ).fetchall()
+    return rows
+
+
 def get_booked_times(appt_date_iso, exclude_appt_id=None):
     """Every time slot already taken (by ANY customer) on a given date, so the
     booking/reschedule pickers can hide them entirely — no double-booking."""
-    conn = get_conn()
+    rows = _get_booked_slots_cached(appt_date_iso)
     if exclude_appt_id is None:
-        rows = conn.execute(
-            "SELECT appt_time FROM appointments WHERE appt_date = ? AND status = 'Confirmed'",
-            (appt_date_iso,),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT appt_time FROM appointments WHERE appt_date = ? AND status = 'Confirmed' AND id != ?",
-            (appt_date_iso, exclude_appt_id),
-        ).fetchall()
-    return {r[0] for r in rows}
+        return {r[0] for r in rows}
+    return {r[0] for r in rows if r[1] != exclude_appt_id}
 
 
-def create_appointment(user_id, service_key, appt_date, appt_time, notes):
+def create_appointment(user_id, service_key, appt_date, appt_time, notes, credit_cents_to_apply=0):
     """Returns (ok, message). Re-checks the slot at write time (not just what
     the picker showed) so two people submitting at nearly the same moment
-    can't both land the same slot."""
+    can't both land the same slot. credit_cents_to_apply (referral credit)
+    is recorded on the appointment and deducted from the user's balance -
+    the owner honors the discount in person, same as every other price on
+    this site (there's no live payment processing here)."""
     conn = get_conn()
     conflict = conn.execute(
         "SELECT id FROM appointments WHERE appt_date = ? AND appt_time = ? AND status = 'Confirmed'",
@@ -337,18 +478,59 @@ def create_appointment(user_id, service_key, appt_date, appt_time, notes):
         return False, "Sorry - that time slot was just booked by someone else. Please pick another."
     service = SERVICES[service_key]
     conn.execute(
-        "INSERT INTO appointments (user_id, service, price, appt_date, appt_time, notes, status, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, 'Confirmed', ?)",
-        (user_id, service["label"], service["price"], appt_date.isoformat(), appt_time, notes.strip(), datetime.now().isoformat()),
+        "INSERT INTO appointments (user_id, service, price, appt_date, appt_time, notes, status, created_at, credit_applied_cents) "
+        "VALUES (?, ?, ?, ?, ?, ?, 'Confirmed', ?, ?)",
+        (
+            user_id, service["label"], service["price"], appt_date.isoformat(), appt_time,
+            notes.strip(), datetime.now().isoformat(), credit_cents_to_apply,
+        ),
     )
+    if credit_cents_to_apply:
+        conn.execute(
+            "UPDATE users SET credit_cents = MAX(0, credit_cents - ?) WHERE id = ?",
+            (credit_cents_to_apply, user_id),
+        )
     conn.commit()
+    _get_booked_slots_cached.clear()
+    _get_appointments_cached.clear()
     user_row = conn.execute("SELECT name, email FROM users WHERE id = ?", (user_id,)).fetchone()
     if user_row:
         notify_booking(user_row[0], user_row[1], service["label"], appt_date.isoformat(), appt_time)
     return True, "Appointment booked."
 
 
-def get_appointments(user_id):
+def get_credit_cents(user_id):
+    conn = get_conn()
+    row = conn.execute("SELECT credit_cents FROM users WHERE id = ?", (user_id,)).fetchone()
+    return row[0] if row and row[0] else 0
+
+
+def get_referral_code(user_id):
+    conn = get_conn()
+    row = conn.execute("SELECT referral_code FROM users WHERE id = ?", (user_id,)).fetchone()
+    return row[0] if row else None
+
+
+LOYALTY_CYCLE = 6  # every 6th completed cut is free
+
+
+def get_loyalty_progress(user_id):
+    """Loyalty punch card is purely informational (no separate redemption
+    tracking/new table) - it's computed straight from appointment history:
+    every past Confirmed appointment counts as one punch. Returns
+    (completed_cuts, punches_in_current_cycle, free_cuts_earned)."""
+    conn = get_conn()
+    today_iso = date.today().isoformat()
+    row = conn.execute(
+        "SELECT COUNT(*) FROM appointments WHERE user_id = ? AND status = 'Confirmed' AND appt_date < ?",
+        (user_id, today_iso),
+    ).fetchone()
+    completed = row[0] if row else 0
+    return completed, completed % LOYALTY_CYCLE, completed // LOYALTY_CYCLE
+
+
+@st.cache_data(ttl=5)
+def _get_appointments_cached(user_id):
     conn = get_conn()
     rows = conn.execute(
         "SELECT id, service, price, appt_date, appt_time, notes, status FROM appointments "
@@ -356,6 +538,10 @@ def get_appointments(user_id):
         (user_id,),
     ).fetchall()
     return rows
+
+
+def get_appointments(user_id):
+    return _get_appointments_cached(user_id)
 
 
 def cancel_appointment(appt_id, user_id):
@@ -371,6 +557,9 @@ def cancel_appointment(appt_id, user_id):
         (appt_id, user_id),
     )
     conn.commit()
+    _get_booked_slots_cached.clear()
+    _get_appointments_cached.clear()
+    _get_all_appointments_cached.clear()
     if row:
         service, appt_date, appt_time, name, email = row
         notify_cancel(name, email, service, appt_date, appt_time, by_owner=False)
@@ -396,6 +585,9 @@ def reschedule_appointment(appt_id, user_id, new_date, new_time):
         (new_date.isoformat(), new_time, appt_id, user_id),
     )
     conn.commit()
+    _get_booked_slots_cached.clear()
+    _get_appointments_cached.clear()
+    _get_all_appointments_cached.clear()
     if old_row:
         service, old_date, old_time, name, email = old_row
         notify_reschedule(name, email, service, old_date, old_time, new_date.isoformat(), new_time, by_owner=False)
@@ -416,6 +608,9 @@ def admin_cancel_appointment(appt_id):
         (appt_id,),
     )
     conn.commit()
+    _get_booked_slots_cached.clear()
+    _get_appointments_cached.clear()
+    _get_all_appointments_cached.clear()
     if row:
         service, appt_date, appt_time, name, email = row
         notify_cancel(name, email, service, appt_date, appt_time, by_owner=True)
@@ -440,14 +635,17 @@ def admin_reschedule_appointment(appt_id, new_date, new_time):
         (new_date.isoformat(), new_time, appt_id),
     )
     conn.commit()
+    _get_booked_slots_cached.clear()
+    _get_appointments_cached.clear()
+    _get_all_appointments_cached.clear()
     if old_row:
         service, old_date, old_time, name, email = old_row
         notify_reschedule(name, email, service, old_date, old_time, new_date.isoformat(), new_time, by_owner=True)
     return True, "Appointment updated."
 
 
-def get_all_appointments():
-    """Every appointment across every customer — used by the owner/admin schedule view."""
+@st.cache_data(ttl=5)
+def _get_all_appointments_cached():
     conn = get_conn()
     rows = conn.execute(
         """
@@ -459,6 +657,13 @@ def get_all_appointments():
         """
     ).fetchall()
     return rows
+
+
+def get_all_appointments():
+    """Every appointment across every customer — used by the owner/admin
+    schedule view. Cached briefly (see _get_all_appointments_cached) since
+    the admin schedule re-queries this on every rerun otherwise."""
+    return _get_all_appointments_cached()
 
 
 def save_style_note(user_id, note):
@@ -874,7 +1079,51 @@ def pretty_appt(service, appt_date_iso, appt_time):
     return f"{service} on {d} at {appt_time}"
 
 
-def notify_signup(name, email):
+# Only two prices exist on this site, so this is enough to recover a
+# duration for the .ics file from the stored price string alone (the
+# appointments table doesn't keep the original SERVICES key).
+PRICE_TO_DURATION_MINUTES = {"$10": 30, "$15": 60}
+
+
+def build_ics_bytes(summary, appt_date_iso, appt_time, price, description=""):
+    """One VEVENT .ics file for a single appointment — works with Google
+    Calendar, Apple Calendar, and Outlook alike. Building this is just
+    string formatting (no network call, no extra dependency), so it's
+    effectively free performance-wise."""
+    start_dt = datetime.strptime(f"{appt_date_iso} {appt_time}", "%Y-%m-%d %I:%M %p")
+    duration = PRICE_TO_DURATION_MINUTES.get(price, 45)
+    end_dt = start_dt + timedelta(minutes=duration)
+    uid = f"{appt_date_iso}-{appt_time}-{random.randint(1000,9999)}@fadedforless".replace(" ", "")
+    dtstamp = datetime.now().strftime("%Y%m%dT%H%M%SZ")
+
+    def esc(text):
+        return text.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
+
+    ics = (
+        "BEGIN:VCALENDAR\r\n"
+        "VERSION:2.0\r\n"
+        "PRODID:-//FADEDFORLESS//Booking//EN\r\n"
+        "CALSCALE:GREGORIAN\r\n"
+        "BEGIN:VEVENT\r\n"
+        f"UID:{uid}\r\n"
+        f"DTSTAMP:{dtstamp}\r\n"
+        f"DTSTART:{start_dt.strftime('%Y%m%dT%H%M%S')}\r\n"
+        f"DTEND:{end_dt.strftime('%Y%m%dT%H%M%S')}\r\n"
+        f"SUMMARY:{esc(summary)}\r\n"
+        f"DESCRIPTION:{esc(description)}\r\n"
+        "LOCATION:FADEDFORLESS Barbershop\r\n"
+        "END:VEVENT\r\n"
+        "END:VCALENDAR\r\n"
+    )
+    return ics.encode("utf-8")
+
+
+def notify_signup(name, email, referral_applied=False):
+    referral_note = (
+        "<p style=\"color:#F1D98B;\"><strong>You've also got $10 in credit</strong> from your "
+        "referral code - it'll show up on the Rewards tab and can be applied at booking.</p>"
+        if referral_applied else ""
+    )
     send_email(
         email,
         "Welcome to FADEDFORLESS",
@@ -882,6 +1131,7 @@ def notify_signup(name, email):
             f"<p>Hey {name},</p>"
             "<p>Your account is set up. You can now book appointments, reschedule, "
             "and get style recommendations any time.</p>"
+            f"{referral_note}"
             "<p style=\"font-size:13px; color:#b8b3a8;\">Tip: if this email landed in your "
             "Spam/Junk folder, mark it \"Not Spam\" (or add faded.for.less@gmail.com to your "
             "contacts) so your booking confirmations and reminders show up in your inbox.</p>"
@@ -972,7 +1222,7 @@ VALID_PAGES = (
     BASE_PAGES
     + AUTH_PAGES
     + (["Your Appointments", "Customers", "Style", "Settings"] if IS_ADMIN else [])
-    + (["Style", "Settings"] if IS_CUSTOMER else [])
+    + (["Style", "Rewards", "Settings"] if IS_CUSTOMER else [])
 )
 
 qp = st.query_params
@@ -1846,6 +2096,72 @@ raw_html(
     }
     .appt-group-label:first-of-type{ margin-top:0; }
 
+    /* ---------- REWARDS (loyalty punch card + referral program) ---------- */
+    .rewards-card{
+        background:var(--charcoal-2);
+        border:1px solid rgba(212,175,55,0.22);
+        border-radius:12px;
+        padding:26px 28px;
+        margin-bottom:22px;
+    }
+    .rewards-card-title{
+        font-family:'Playfair Display', serif;
+        font-size:1.35rem;
+        color:#F5F1E6;
+        margin-bottom:4px;
+    }
+    .rewards-card-sub{ color:#847f72; font-size:0.9rem; margin-bottom:18px; }
+    .punch-row{ display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px; }
+    .punch{
+        width:44px; height:44px;
+        border-radius:50%;
+        display:flex; align-items:center; justify-content:center;
+        font-size:1.1rem;
+        border:1.5px dashed rgba(212,175,55,0.4);
+        color:#4a463d;
+        flex-shrink:0;
+    }
+    .punch.filled{
+        border:1.5px solid var(--gold);
+        background:linear-gradient(120deg, var(--gold-light), var(--gold));
+        color:var(--premium-black);
+        font-weight:800;
+    }
+    .reward-banner{
+        background:linear-gradient(120deg, rgba(212,175,55,0.18), rgba(212,175,55,0.05));
+        border:1px solid rgba(212,175,55,0.5);
+        border-radius:8px;
+        padding:14px 18px;
+        color:var(--gold-light);
+        font-weight:700;
+        margin-top:8px;
+    }
+    .referral-code-box{
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:14px;
+        background:var(--charcoal-3);
+        border:1px dashed rgba(212,175,55,0.45);
+        border-radius:8px;
+        padding:16px 20px;
+        margin:6px 0 16px 0;
+        flex-wrap:wrap;
+    }
+    .referral-code{
+        font-family:'Playfair Display', serif;
+        font-size:1.5rem;
+        letter-spacing:3px;
+        color:var(--gold-light);
+        font-weight:700;
+    }
+    .credit-balance-line{
+        font-size:1.6rem;
+        font-weight:800;
+        color:var(--gold);
+        font-family:'Playfair Display', serif;
+    }
+
     /* ---------- ADMIN SCHEDULE / CALENDAR ---------- */
     .cal-grid{
         display:grid;
@@ -2159,6 +2475,72 @@ raw_html(
         color:#F7F3E7;
     }
     .cut-result-meta{ margin:10px 0 16px 0; }
+
+    /* ---------- VISUAL POLISH ---------- */
+    /* Subtle film-grain texture over the whole page - a tiny tiled SVG
+       noise pattern at very low opacity with mix-blend-mode so text stays
+       perfectly readable. Pure CSS, no image download (it's an inline SVG
+       data URI), so this costs nothing extra to load or render. */
+    [data-testid="stAppViewContainer"]::before{
+        content:"";
+        position:fixed;
+        inset:0;
+        z-index:9999;
+        pointer-events:none;
+        opacity:0.035;
+        mix-blend-mode:overlay;
+        background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    }
+
+    /* Thin gold scrollbar instead of the default browser one. */
+    ::-webkit-scrollbar{ width:10px; height:10px; }
+    ::-webkit-scrollbar-track{ background:var(--black); }
+    ::-webkit-scrollbar-thumb{
+        background:linear-gradient(180deg, var(--gold-light), var(--gold));
+        border-radius:10px;
+        border:2px solid var(--black);
+    }
+    html{ scrollbar-color:var(--gold) var(--black); scrollbar-width:thin; }
+
+    /* Ornamental gold flourish in the middle of every section divider
+       site-wide, instead of a plain line - a single shared rule, so every
+       page that already uses .divider picks this up automatically. */
+    .divider{ position:relative; overflow:visible; }
+    .divider::after{
+        content:"◆";
+        position:absolute;
+        top:50%; left:50%;
+        transform:translate(-50%, -50%);
+        background:var(--black);
+        color:var(--gold);
+        font-size:0.7rem;
+        padding:0 10px;
+    }
+
+    /* Gold-foil hover glow + gentle 3D tilt, added to every card style
+       already on the site (price cards, style showcase, feature pillars,
+       service picker) - just enhancing existing :hover rules, no new
+       markup or elements needed. */
+    .price-card:hover, .service-card:hover, .pillar:hover{
+        transform:perspective(800px) rotateX(1.5deg) translateY(-6px);
+        box-shadow:0 22px 45px rgba(0,0,0,0.45), 0 0 24px rgba(212,175,55,0.18);
+    }
+    .style-card:hover{
+        transform:perspective(800px) rotateX(1.5deg) scale(1.02);
+        box-shadow:0 18px 40px rgba(212,175,55,0.22);
+    }
+    .service-card{ transition:transform 0.25s ease, box-shadow 0.25s ease, border-color 0.2s ease; }
+
+    /* Generic scroll-reveal: any element with class="reveal" starts faded
+       down and rises into place the first time it scrolls into view (see
+       the shared inject_scroll_reveal() JS below). Same mechanism already
+       used for the "What You Get" step cards, just made reusable. */
+    .reveal{
+        opacity:0;
+        transform:translateY(28px);
+        transition:opacity 0.6s ease, transform 0.6s ease;
+    }
+    .reveal.visible{ opacity:1; transform:translateY(0); }
     </style>
     """.replace("__IMG_HERO__", IMG_HERO)
 )
@@ -2307,7 +2689,7 @@ def render_home():
         f"""
         <div class="craft-item">
             <input type="checkbox" id="lb-craft-{i}" class="lb-toggle" />
-            <label for="lb-craft-{i}" class="style-card">
+            <label for="lb-craft-{i}" class="style-card reveal">
                 <img src="{s['img']}" />
                 <div class="style-label">
                     <span class="tag">{s['tag']}</span>
@@ -2386,10 +2768,10 @@ def render_about():
                         and see the work for yourself.
                     </p>
                     <div class="pillars">
-                        <div class="pillar"><b>17, Growing Fast</b><br/>4 years of real experience so far</div>
-                        <div class="pillar"><b>Affordable</b><br/>Pricing that respects your wallet</div>
-                        <div class="pillar"><b>Precise</b><br/>Clean lines and sharp fades</div>
-                        <div class="pillar"><b>Premium Feel</b><br/>A pro experience, fair price</div>
+                        <div class="pillar reveal"><b>17, Growing Fast</b><br/>4 years of real experience so far</div>
+                        <div class="pillar reveal"><b>Affordable</b><br/>Pricing that respects your wallet</div>
+                        <div class="pillar reveal"><b>Precise</b><br/>Clean lines and sharp fades</div>
+                        <div class="pillar reveal"><b>Premium Feel</b><br/>A pro experience, fair price</div>
                     </div>
                 </div>
             </div>
@@ -2422,7 +2804,7 @@ def render_pricing():
             with col_10:
                 raw_html(
                     f"""
-                    <div class="price-card">
+                    <div class="price-card reveal">
                         <div class="price-card-img" style="background-image:url('{IMG_PRICE_10}');"></div>
                         <div class="price-card-body">
                             <div class="price-name">Fade or Trim</div>
@@ -2453,7 +2835,7 @@ def render_pricing():
             with col_15:
                 raw_html(
                     f"""
-                    <div class="price-card featured">
+                    <div class="price-card featured reveal">
                         <div class="badge">Most Popular</div>
                         <div class="price-card-img" style="background-image:url('{IMG_PRICE_15}');"></div>
                         <div class="price-card-body">
@@ -2729,6 +3111,11 @@ def render_login():
                     phone = st.text_input("Phone Number *", placeholder="e.g. (555) 123-4567")
                     password = st.text_input("Password", type="password", key="signup_password")
                     confirm = st.text_input("Confirm Password", type="password")
+                    referral_input = st.text_input(
+                        "Referral Code (optional)",
+                        placeholder="Got a code from a friend? You'll both get $10 credit",
+                        key="signup_referral",
+                    )
                     submitted = st.form_submit_button("Create Account")
                     if submitted:
                         if not name or not email or not phone or not password:
@@ -2745,7 +3132,7 @@ def render_login():
                             st.error("This email is reserved. Please use a different one.")
                         else:
                             with st.spinner("Creating your account..."):
-                                ok, msg = create_user(name, email, phone, password)
+                                ok, msg = create_user(name, email, phone, password, referral_input)
                             if ok:
                                 user = verify_login(email, password)
                                 user["is_admin"] = False
@@ -2915,13 +3302,32 @@ def render_book_now():
                 raw_html('<div class="booking-step-label"><span class="step-num">3</span>Anything We Should Know?</div>')
                 notes = st.text_area("Notes (optional)", placeholder="Anything the barber should know", key="booking_notes", label_visibility="collapsed")
 
+                credit_cents = get_credit_cents(user["id"]) if user["id"] else 0
+                credit_to_apply = 0
+                if credit_cents > 0 and service_key:
+                    service_price_cents = SERVICE_PRICE_CENTS[service_key]
+                    max_applicable = min(credit_cents, service_price_cents)
+                    apply_credit = st.checkbox(
+                        f"Apply my {format_cents(credit_cents)} referral credit to this booking",
+                        key="apply_credit_checkbox",
+                        value=True,
+                    )
+                    if apply_credit:
+                        credit_to_apply = max_applicable
+
                 if appt_time is not None:
                     pretty_selected_date = appt_date.strftime("%a, %b %d, %Y")
+                    final_price_cents = max(0, SERVICE_PRICE_CENTS[service_key] - credit_to_apply)
+                    price_line = (
+                        f"<span style='text-decoration:line-through; color:#847f72; margin-right:6px;'>{SERVICES[service_key]['price']}</span>{format_cents(final_price_cents)}"
+                        if credit_to_apply
+                        else SERVICES[service_key]['price']
+                    )
                     raw_html(
                         f"""
                         <div class="booking-summary">
                             <div class="booking-summary-label">You're About To Book</div>
-                            <div class="booking-summary-line">{SERVICES[service_key]['label']} · {SERVICES[service_key]['price']} — {pretty_selected_date} at {appt_time}</div>
+                            <div class="booking-summary-line">{SERVICES[service_key]['label']} · {price_line} — {pretty_selected_date} at {appt_time}</div>
                         </div>
                         """
                     )
@@ -2931,7 +3337,10 @@ def render_book_now():
                         st.error("That day is fully booked - please choose another date.")
                     else:
                         with st.spinner("Booking your appointment..."):
-                            ok, msg = create_appointment(user["id"], service_key, appt_date, appt_time, notes or "")
+                            ok, msg = create_appointment(
+                                user["id"], service_key, appt_date, appt_time, notes or "",
+                                credit_cents_to_apply=credit_to_apply,
+                            )
                         if ok:
                             st.success("Appointment booked! See it below.")
                             st.rerun()
@@ -2965,7 +3374,7 @@ def render_book_now():
                     )
                     if status == "Confirmed":
                         with st.container(key=f"appt_actions_{appt_id}"):
-                            btn_a, btn_b = st.columns(2)
+                            btn_a, btn_b, btn_c = st.columns(3)
                             with btn_a:
                                 if st.button("Change Time", key=f"change_{appt_id}"):
                                     st.session_state.editing_appt_id = (
@@ -2977,6 +3386,21 @@ def render_book_now():
                                     with st.spinner("Cancelling..."):
                                         cancel_appointment(appt_id, user["id"])
                                     st.rerun()
+                            with btn_c:
+                                st.download_button(
+                                    "📅 Add to Calendar",
+                                    data=build_ics_bytes(
+                                        f"{service} - FADEDFORLESS",
+                                        appt_date_str,
+                                        appt_time_str,
+                                        price,
+                                        description=f"Appointment notes: {appt_notes}" if appt_notes else "",
+                                    ),
+                                    file_name=f"fadedforless-{appt_date_str}-{appt_time_str.replace(':', '').replace(' ', '')}.ics",
+                                    mime="text/calendar",
+                                    key=f"ics_{appt_id}",
+                                    use_container_width=True,
+                                )
 
                         if st.session_state.editing_appt_id == appt_id:
                             # Not st.form — the time list has to refresh live
@@ -3067,6 +3491,83 @@ def render_book_now():
 # ----------------------------------------------------------------------------
 # INSTAGRAM PAGE
 # ----------------------------------------------------------------------------
+def render_rewards():
+    user = st.session_state.user
+    if not user or user.get("is_admin"):
+        st.warning("Log in with a customer account to see your Rewards.")
+        return
+
+    raw_html(
+        """
+        <div class="section" style="padding-bottom:20px;">
+            <div class="booking-head">
+                <div class="eyebrow" style="justify-content:center;">Rewards</div>
+                <h2 class="section-title">Your Loyalty &amp; Referrals</h2>
+                <div class="divider" style="margin-left:auto; margin-right:auto;"></div>
+            </div>
+        </div>
+        """
+    )
+
+    left, mid, right = st.columns([1, 2.2, 1])
+    with mid:
+        # ---------- LOYALTY PUNCH CARD ----------
+        completed, punches, free_earned = get_loyalty_progress(user["id"])
+        punch_html = "".join(
+            f'<div class="punch{" filled" if i < punches else ""}">{"✓" if i < punches else ""}</div>'
+            for i in range(LOYALTY_CYCLE)
+        )
+        remaining = LOYALTY_CYCLE - punches if punches else LOYALTY_CYCLE
+        if free_earned:
+            plural = "s" if free_earned != 1 else ""
+            progress_html = (
+                f'<div class="reward-banner">🎉 You have {free_earned} free haircut{plural} earned '
+                "- mention it next time you're in the chair!</div>"
+            )
+        else:
+            plural = "s" if remaining != 1 else ""
+            progress_html = (
+                f'<div style="color:#847f72; font-size:0.88rem;">{remaining} more cut{plural} '
+                "until your next free one.</div>"
+            )
+        raw_html(
+            f"""
+            <div class="rewards-card">
+                <div class="rewards-card-title">Loyalty Punch Card</div>
+                <div class="rewards-card-sub">Every {LOYALTY_CYCLE}th cut is on us. {completed} cut{'s' if completed != 1 else ''} completed so far.</div>
+                <div class="punch-row">{punch_html}</div>
+                {progress_html}
+            </div>
+            """
+        )
+
+        # ---------- REFERRAL PROGRAM ----------
+        my_code = get_referral_code(user["id"]) or "—"
+        credit_cents = get_credit_cents(user["id"])
+        credit_hint = (
+            '<p style="color:#847f72; font-size:0.85rem; margin-top:10px;">Credit is applied '
+            "automatically as an option when you book - look for the checkbox on the Book Now page.</p>"
+            if credit_cents else ""
+        )
+        raw_html(
+            f"""
+            <div class="rewards-card">
+                <div class="rewards-card-title">Refer a Friend, Get $10</div>
+                <div class="rewards-card-sub">Share your code — when a friend signs up with it, you BOTH get $10 in credit toward a cut.</div>
+                <div class="referral-code-box">
+                    <div class="referral-code">{my_code}</div>
+                    <span class="chip">Share this at signup</span>
+                </div>
+                <div class="rewards-card-sub" style="margin-bottom:6px;">Your Available Credit</div>
+                <div class="credit-balance-line">{format_cents(credit_cents)}</div>
+                {credit_hint}
+            </div>
+            """
+        )
+
+    st.markdown("<div style='height:60px;'></div>", unsafe_allow_html=True)
+
+
 def render_instagram():
     raw_html(
         f"""
@@ -3225,7 +3726,7 @@ def render_my_schedule():
                     """
                 )
                 with st.container(key=f"admin_appt_actions_{appt_id}"):
-                    btn_a, btn_b = st.columns(2)
+                    btn_a, btn_b, btn_c = st.columns(3)
                     with btn_a:
                         if st.button("Change Time", key=f"admin_change_{appt_id}"):
                             st.session_state.admin_editing_appt_id = (
@@ -3237,6 +3738,21 @@ def render_my_schedule():
                             with st.spinner("Cancelling..."):
                                 admin_cancel_appointment(appt_id)
                             st.rerun()
+                    with btn_c:
+                        st.download_button(
+                            "📅 Add to Calendar",
+                            data=build_ics_bytes(
+                                f"{service} - {cust_name} - FADEDFORLESS",
+                                appt_date_str,
+                                appt_time_str,
+                                price,
+                                description=f"Customer: {cust_name} ({contact})" if contact else f"Customer: {cust_name}",
+                            ),
+                            file_name=f"fadedforless-{appt_date_str}-{appt_time_str.replace(':', '').replace(' ', '')}.ics",
+                            mime="text/calendar",
+                            key=f"admin_ics_{appt_id}",
+                            use_container_width=True,
+                        )
 
                 if st.session_state.admin_editing_appt_id == appt_id:
                     # Not st.form — same reasoning as the customer reschedule:
@@ -3785,6 +4301,43 @@ elif current_page == "Settings":
     render_settings()
 elif current_page == "Style":
     render_style()
+elif current_page == "Rewards":
+    render_rewards()
+
+# ----------------------------------------------------------------------------
+# GENERIC SCROLL-REVEAL (any element with class="reveal" on the current page)
+# ----------------------------------------------------------------------------
+# One small iframe that watches every .reveal element on whichever page just
+# rendered and fades/rises each one in as it's scrolled into view - same
+# IntersectionObserver technique already used for the "What You Get" step
+# cards, generalized so price cards, style-showcase cards, and feature
+# pillars get it too without duplicating this script per page. Height=0
+# iframe, no visible footprint, negligible cost.
+components.html(
+    """
+    <script>
+    (function() {
+        const doc = window.parent.document;
+        const els = Array.from(doc.querySelectorAll('.reveal'));
+        const unbound = els.filter(el => !el.dataset.revealBound);
+        if (!unbound.length) return;
+        unbound.forEach(el => { el.dataset.revealBound = "1"; });
+
+        const observer = new IntersectionObserver((entries) => {
+            entries.forEach((entry) => {
+                if (entry.isIntersecting) {
+                    entry.target.classList.add('visible');
+                    observer.unobserve(entry.target);
+                }
+            });
+        }, { threshold: 0.15, root: null, rootMargin: "0px 0px -40px 0px" });
+
+        unbound.forEach(el => observer.observe(el));
+    })();
+    </script>
+    """,
+    height=0,
+)
 
 # ----------------------------------------------------------------------------
 # FOOTER
