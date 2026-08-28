@@ -11,6 +11,7 @@ import calendar as cal_module
 import smtplib
 import ssl
 import threading
+import time
 from email.message import EmailMessage
 from datetime import date, datetime, timedelta
 
@@ -235,6 +236,13 @@ def init_db():
         "ALTER TABLE users ADD COLUMN referral_code TEXT",
         "ALTER TABLE users ADD COLUMN credit_cents INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE users ADD COLUMN referred_by TEXT",
+        # Tracks whether the referral bonus has already been paid out for
+        # this user (both to them and to whoever referred them). The bonus
+        # is no longer granted at signup — it's granted the first time the
+        # owner actually checks off one of this customer's haircuts on the
+        # Customer Punches tab, i.e. proof the referred friend really came
+        # in. This flag makes sure that only ever happens once per user.
+        "ALTER TABLE users ADD COLUMN referral_credit_awarded INTEGER NOT NULL DEFAULT 0",
     ):
         try:
             conn.execute(stmt)
@@ -382,6 +390,12 @@ def create_user(name, email, phone, password, referral_code_used=None):
     new_user_row = conn.execute("SELECT id FROM users WHERE email = ?", (clean_email,)).fetchone()
     new_user_id = new_user_row[0] if new_user_row else None
 
+    # Referral codes are recorded at signup, but the $10 credit for BOTH
+    # people is no longer granted here. It's granted later, the first time
+    # the owner actually checks this new customer off on the Customer
+    # Punches tab — real proof the referred friend showed up and got a
+    # haircut, instead of paying out on a signup that might never turn into
+    # a visit. See mark_loyalty_checked() for where the payout happens.
     referral_applied = False
     if referral_code_used and referral_code_used.strip():
         entered = referral_code_used.strip().upper()
@@ -389,27 +403,9 @@ def create_user(name, email, phone, password, referral_code_used=None):
             "SELECT id, name, email FROM users WHERE referral_code = ?", (entered,)
         ).fetchone()
         if referrer and referrer[0] != new_user_id:
-            conn.execute(
-                "UPDATE users SET credit_cents = credit_cents + ? WHERE id = ?",
-                (REFERRAL_BONUS_CENTS, new_user_id),
-            )
-            conn.execute(
-                "UPDATE users SET credit_cents = credit_cents + ? WHERE id = ?",
-                (REFERRAL_BONUS_CENTS, referrer[0]),
-            )
             conn.execute("UPDATE users SET referred_by = ? WHERE id = ?", (entered, new_user_id))
             conn.commit()
             referral_applied = True
-            send_email(
-                referrer[2],
-                "You earned $10 in referral credit!",
-                email_wrapper(
-                    f"<p>Hey {referrer[1]},</p>"
-                    f"<p>{clean_name} just signed up using your referral code - "
-                    f"you've got <strong>$10 in credit</strong> toward your next visit.</p>"
-                    "<p>- FADEDFORLESS</p>"
-                ),
-            )
 
     notify_signup(clean_name, clean_email, referral_applied)
     return True, "Account created."
@@ -528,9 +524,20 @@ def get_credit_cents(user_id):
 
 
 def get_referral_code(user_id):
+    """Returns this user's referral code, generating and saving one on the
+    spot if they somehow don't have one yet (e.g. an account created before
+    the referral column existed) — that's what made the code silently show
+    up blank/missing for some accounts instead of just always being there."""
     conn = get_conn()
-    row = conn.execute("SELECT referral_code FROM users WHERE id = ?", (user_id,)).fetchone()
-    return row[0] if row else None
+    row = conn.execute("SELECT referral_code, name FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not row:
+        return None
+    code, name = row
+    if not code:
+        code = _generate_referral_code(name)
+        conn.execute("UPDATE users SET referral_code = ? WHERE id = ?", (code, user_id))
+        conn.commit()
+    return code
 
 
 LOYALTY_CYCLE = 3  # every 3 checked cuts earns a free 4th
@@ -571,32 +578,134 @@ def get_unchecked_appointments():
 def mark_loyalty_checked(appt_id, user_id):
     """Owner taps the check on one appointment: marks it punched, bumps
     that customer's punch count, and — every LOYALTY_CYCLE punches — banks
-    a free cut and emails the customer about it."""
+    a free cut and emails the customer a big "book it now" email about it.
+    An email also goes out on every regular punch (not just the free one),
+    so the customer always knows their card moved. This is also the moment
+    a pending referral gets paid out: if this is this customer's first-ever
+    checked haircut and they signed up with a referral code, that's real
+    proof the referred friend showed up, so both people get their $10 now
+    (see REFERRAL_BONUS_CENTS) instead of at signup. Does the whole
+    punch/reset/reward decision in ONE round trip (a single SELECT to read
+    the current count, then one combined UPDATE) instead of a separate
+    write-then-read-then-write-again sequence - down from up to 6 Turso
+    round trips to 3. Returns (reward_hit, referral_awarded)."""
     conn = get_conn()
+    row = conn.execute(
+        "SELECT loyalty_punches, name, email, referred_by, referral_credit_awarded "
+        "FROM users WHERE id = ?",
+        (user_id,),
+    ).fetchone()
+    current_punches = row[0] if row else 0
+    new_punches = current_punches + 1
+    reward_hit = new_punches >= LOYALTY_CYCLE
+
     conn.execute("UPDATE appointments SET loyalty_checked = 1 WHERE id = ?", (appt_id,))
-    conn.execute("UPDATE users SET loyalty_punches = loyalty_punches + 1 WHERE id = ?", (user_id,))
-    conn.commit()
-    row = conn.execute("SELECT loyalty_punches, name, email FROM users WHERE id = ?", (user_id,)).fetchone()
-    _get_unchecked_appointments_cached.clear()
-    if row and row[0] >= LOYALTY_CYCLE:
+    if reward_hit:
         conn.execute(
             "UPDATE users SET loyalty_punches = 0, loyalty_free_earned = loyalty_free_earned + 1 WHERE id = ?",
             (user_id,),
         )
-        conn.commit()
-        name, email = row[1], row[2]
+    else:
+        conn.execute("UPDATE users SET loyalty_punches = ? WHERE id = ?", (new_punches, user_id))
+    conn.commit()
+    _get_unchecked_appointments_cached.clear()
+
+    if not row:
+        return reward_hit, False
+
+    name, email, referred_by_code, credit_awarded = row[1], row[2], row[3], row[4]
+
+    # ---------- Pay out a pending referral, if this is the trigger ----------
+    referral_awarded = False
+    if referred_by_code and not credit_awarded:
+        referrer = conn.execute(
+            "SELECT id, name, email FROM users WHERE referral_code = ?", (referred_by_code,)
+        ).fetchone()
+        if referrer:
+            conn.execute(
+                "UPDATE users SET credit_cents = credit_cents + ? WHERE id = ?",
+                (REFERRAL_BONUS_CENTS, referrer[0]),
+            )
+            conn.execute(
+                "UPDATE users SET credit_cents = credit_cents + ?, referral_credit_awarded = 1 WHERE id = ?",
+                (REFERRAL_BONUS_CENTS, user_id),
+            )
+            conn.commit()
+            referral_awarded = True
+            send_email(
+                referrer[2],
+                "You earned $10 in referral credit!",
+                email_wrapper(
+                    f"<p>Hey {referrer[1]},</p>"
+                    f"<p>{name} - who signed up with your referral code - just came in for "
+                    f"their first haircut, so you've got <strong>$10 in credit</strong> toward "
+                    "your next visit.</p>"
+                    "<p>- FADEDFORLESS</p>"
+                ),
+            )
+            send_email(
+                email,
+                "You earned $10 in referral credit!",
+                email_wrapper(
+                    f"<p>Hey {name},</p>"
+                    "<p>Since this was your first haircut with us, the referral credit from "
+                    f"signing up is now yours - <strong>$10 in credit</strong> toward your next visit.</p>"
+                    "<p>- FADEDFORLESS</p>"
+                ),
+            )
+
+    # ---------- Punch email: every punch gets one, the free one gets a big one ----------
+    if reward_hit:
         send_email(
             email,
-            "Your next haircut is FREE! 🎉",
+            "🎉 Your Next Haircut is FREE - Book It Now!",
+            email_wrapper(
+                f"""
+                <p style="font-size:20px; text-align:center; margin:0 0 6px 0;">🎉</p>
+                <h2 style="color:#F1D98B; text-align:center; margin:0 0 14px 0; font-size:22px;">
+                    You've Earned a FREE Haircut!
+                </h2>
+                <p>Hey {name},</p>
+                <p>You just hit {LOYALTY_CYCLE} cuts on your loyalty punch card - your next
+                haircut is completely on the house.</p>
+                <p style="text-align:center; margin:26px 0;">
+                    <a href="{BOOK_NOW_URL}" target="_blank"
+                       style="background:#D4AF37; color:#0d0d0d; font-weight:700; text-decoration:none;
+                              padding:14px 32px; border-radius:8px; font-size:15px; display:inline-block;">
+                        Book Your Free Haircut Now
+                    </a>
+                </p>
+                <p style="font-size:13px; color:#b8b3a8;">Just mention it when you sit down in the chair.</p>
+                <p>- FADEDFORLESS</p>
+                """
+            ),
+        )
+    else:
+        remaining = LOYALTY_CYCLE - new_punches
+        plural = "s" if remaining != 1 else ""
+        send_email(
+            email,
+            f"Punch added - {new_punches}/{LOYALTY_CYCLE} on your loyalty card",
             email_wrapper(
                 f"<p>Hey {name},</p>"
-                f"<p>You just hit {LOYALTY_CYCLE} cuts on your loyalty punch card - "
-                "your next haircut is on the house. Just mention it next time you're in the chair.</p>"
+                f"<p>Your loyalty punch card is now at <strong>{new_punches}/{LOYALTY_CYCLE}</strong> - "
+                f"{remaining} more cut{plural} until your next one is free.</p>"
                 "<p>- FADEDFORLESS</p>"
             ),
         )
-        return True
-    return False
+
+    return reward_hit, referral_awarded
+
+
+def dismiss_loyalty_appt(appt_id):
+    """Owner dismisses an appointment from the punch list WITHOUT it
+    counting toward the customer's loyalty card — e.g. a walk-in already
+    accounted for elsewhere, or one that shouldn't be punched. Just drops
+    it off the list."""
+    conn = get_conn()
+    conn.execute("UPDATE appointments SET loyalty_checked = 1 WHERE id = ?", (appt_id,))
+    conn.commit()
+    _get_unchecked_appointments_cached.clear()
 
 
 @st.cache_data(ttl=5)
@@ -1068,6 +1177,13 @@ GMAIL_ADDRESS = "faded.for.less@gmail.com"
 GMAIL_APP_PASSWORD = _get_secret("GMAIL_APP_PASSWORD")
 OWNER_EMAIL = "freddiesawiras2@gmail.com"
 
+# The live URL of this site, used to build a clickable "Book Now" link/button
+# inside emails (an email can't link to a relative Streamlit page). Set the
+# SITE_URL secret/env var to the real deployed URL — falls back to a
+# placeholder so the app still runs without it configured.
+SITE_URL = _get_secret("SITE_URL", "https://fadedforless.streamlit.app").rstrip("/")
+BOOK_NOW_URL = f"{SITE_URL}/?page=Book+Now"
+
 
 def email_is_configured():
     return bool(GMAIL_ADDRESS and GMAIL_APP_PASSWORD)
@@ -1100,7 +1216,15 @@ def _send_email_raw(to_email, subject, html_body):
 def _send_email_background(to_email, subject, html_body):
     ok, error = _send_email_raw(to_email, subject, html_body)
     if not ok:
-        print(f"[email] Failed to send to {to_email}: {error}")
+        # Most SMTP failures here are transient (a brief network blip, Gmail
+        # momentarily rate-limiting) rather than permanent, so wait a bit and
+        # try once more before giving up — still nowhere near the "within 3
+        # minutes" target since this whole thing already runs off the
+        # critical path on a background thread.
+        time.sleep(20)
+        ok, error = _send_email_raw(to_email, subject, html_body)
+        if not ok:
+            print(f"[email] Failed to send to {to_email} after retry: {error}")
 
 
 def send_email(to_email, subject, html_body):
@@ -1238,8 +1362,9 @@ def build_ics_bytes_multi(events):
 
 def notify_signup(name, email, referral_applied=False):
     referral_note = (
-        "<p style=\"color:#F1D98B;\"><strong>You've also got $10 in credit</strong> from your "
-        "referral code - it'll show up on the Rewards tab and can be applied at booking.</p>"
+        "<p style=\"color:#F1D98B;\"><strong>Your referral code is on file</strong> - "
+        "once you come in and get your first haircut, you AND your friend will each get "
+        "$10 in credit, automatically.</p>"
         if referral_applied else ""
     )
     send_email(
@@ -1332,7 +1457,7 @@ def notify_reschedule(name, email, service, old_date_iso, old_time, new_date_iso
 if "user" not in st.session_state:
     st.session_state.user = None
 
-BASE_PAGES = ["Home", "About Me", "Pricing", "Book Now"]
+BASE_PAGES = ["Home", "Pricing", "Book Now"]
 IS_ADMIN = bool(st.session_state.user and st.session_state.user.get("is_admin"))
 IS_CUSTOMER = bool(st.session_state.user and not IS_ADMIN)
 AUTH_PAGES = [] if st.session_state.user else ["Log In"]
@@ -2750,7 +2875,13 @@ with st.container(key="site_navbar"):
     # pressed, in which case they stack into a vertical dropdown.
     n_pages = len(VALID_PAGES)
     links_key = "nav_links_open" if st.session_state.mobile_menu_open else "nav_links_closed"
-    NAV_LABELS = {"Your Appointments": "Your Appts", "Style": "AI Consult", "Customer Punches": "Punches"}
+    # Shortened labels for tabs whose full page name is too long to fit
+    # comfortably in the nav pill/button on smaller screens.
+    NAV_LABELS = {
+        "Your Appointments": "Appts",
+        "Customer Punches": "Punches",
+        "Customers": "Clients",
+    }
     with st.container(key=links_key):
         link_cols = st.columns([1] * n_pages, vertical_alignment="center")
         for i, page_name in enumerate(VALID_PAGES):
@@ -2838,23 +2969,7 @@ def render_home():
         """
     )
 
-    raw_html(
-        f"""
-        <div class="section section-tight" style="padding-top:0;">
-            <div class="insta-panel">
-                <div class="insta-icon">📷</div>
-                <div class="insta-handle">@fadedforless</div>
-                <p class="insta-sub">See the latest work, book your next cut, and follow along on Instagram.</p>
-                <a class="btn-insta" href="{INSTAGRAM_URL}" target="_blank">Follow on Instagram</a>
-            </div>
-        </div>
-        """
-    )
-
-# ----------------------------------------------------------------------------
-# ABOUT PAGE
-# ----------------------------------------------------------------------------
-def render_about():
+    # ---------- ABOUT ME (merged in from the old standalone "About Me" tab) ----------
     raw_html(
         f"""
         <div class="section">
@@ -2892,6 +3007,19 @@ def render_about():
                         <div class="pillar reveal"><b>Premium Feel</b><br/>A pro experience, fair price</div>
                     </div>
                 </div>
+            </div>
+        </div>
+        """
+    )
+
+    raw_html(
+        f"""
+        <div class="section section-tight" style="padding-top:0;">
+            <div class="insta-panel">
+                <div class="insta-icon">📷</div>
+                <div class="insta-handle">@fadedforless</div>
+                <p class="insta-sub">See the latest work, book your next cut, and follow along on Instagram.</p>
+                <a class="btn-insta" href="{INSTAGRAM_URL}" target="_blank">Follow on Instagram</a>
             </div>
         </div>
         """
@@ -3117,7 +3245,7 @@ def render_login():
                     confirm = st.text_input("Confirm Password", type="password")
                     referral_input = st.text_input(
                         "Referral Code (optional)",
-                        placeholder="Got a code from a friend? You'll both get $10 credit",
+                        placeholder="Got a code from a friend? You'll both get $10 after your first cut",
                         key="signup_referral",
                     )
                     submitted = st.form_submit_button("Create Account")
@@ -3555,7 +3683,7 @@ def render_rewards():
             f"""
             <div class="rewards-card">
                 <div class="rewards-card-title">Refer a Friend, Get $10</div>
-                <div class="rewards-card-sub">Share your code — when a friend signs up with it, you BOTH get $10 in credit toward a cut.</div>
+                <div class="rewards-card-sub">Share your code — once a friend signs up with it AND comes in for their first haircut, you BOTH get $10 in credit toward a cut.</div>
                 <div class="referral-code-box">
                     <div class="referral-code">{my_code}</div>
                     <span class="chip">Share this at signup</span>
@@ -3897,16 +4025,26 @@ def render_admin_punches():
                     </div>
                     """
                 )
-                if st.button("✓ Check This Off", key=f"punch_{appt_id}", use_container_width=True):
-                    reward_hit = mark_loyalty_checked(appt_id, cust_user_id)
-                    if reward_hit:
-                        st.success(f"{cust_name} just earned a free haircut! An email went out to them.")
-                    st.rerun()
+                btn_check, btn_dismiss = st.columns([3, 1])
+                with btn_check:
+                    if st.button("✓ Check This Off", key=f"punch_{appt_id}", use_container_width=True):
+                        with st.spinner("Updating loyalty card..."):
+                            reward_hit, referral_awarded = mark_loyalty_checked(appt_id, cust_user_id)
+                        if reward_hit:
+                            st.success(f"{cust_name} just earned a free haircut! An email went out to them.")
+                        if referral_awarded:
+                            st.success(f"Referral credit paid out - {cust_name} and their referrer each got $10.")
+                        st.rerun()
+                with btn_dismiss:
+                    if st.button("✕", key=f"dismiss_{appt_id}", use_container_width=True, help="Remove from this list without counting it as a punch"):
+                        with st.spinner("Dismissing..."):
+                            dismiss_loyalty_appt(appt_id)
+                        st.rerun()
 
     st.markdown("<div style='height:60px;'></div>", unsafe_allow_html=True)
 
 
-
+def render_customers():
     user = st.session_state.user
     if not user or not user.get("is_admin"):
         st.warning("This page is only available to the shop owner.")
@@ -4089,11 +4227,12 @@ def render_settings():
                 if errors:
                     st.error(f"Closing time has to be after opening time for: {', '.join(errors)}.")
                 else:
-                    for wd_key, wd_label in WEEKDAYS:
-                        d_start, d_end, d_closed = day_inputs[wd_key]
-                        set_setting(f"avail_{wd_key}_start", d_start)
-                        set_setting(f"avail_{wd_key}_end", d_end)
-                        set_setting(f"avail_{wd_key}_closed", "1" if d_closed else "0")
+                    with st.spinner("Saving availability..."):
+                        for wd_key, wd_label in WEEKDAYS:
+                            d_start, d_end, d_closed = day_inputs[wd_key]
+                            set_setting(f"avail_{wd_key}_start", d_start)
+                            set_setting(f"avail_{wd_key}_end", d_end)
+                            set_setting(f"avail_{wd_key}_closed", "1" if d_closed else "0")
                     st.session_state.avail_just_saved = True
                     st.rerun()
 
@@ -4143,7 +4282,8 @@ def render_settings():
                     mime = "image/png" if ext == "png" else "image/jpeg"
                     encoded = base64.b64encode(uploaded_pic.getvalue()).decode("ascii")
                     pic_b64 = f"data:{mime};base64,{encoded}"
-                ok, msg = update_profile(user["id"], new_email, new_phone, pic_b64)
+                with st.spinner("Saving changes..."):
+                    ok, msg = update_profile(user["id"], new_email, new_phone, pic_b64)
                 if ok:
                     st.session_state.user["email"] = new_email.strip().lower()
                     st.session_state.user["phone"] = new_phone.strip()
@@ -4368,8 +4508,6 @@ def render_style():
 # ----------------------------------------------------------------------------
 if current_page == "Home":
     render_home()
-elif current_page == "About Me":
-    render_about()
 elif current_page == "Pricing":
     render_pricing()
 elif current_page == "Book Now":
