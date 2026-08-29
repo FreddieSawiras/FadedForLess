@@ -285,6 +285,18 @@ def init_db():
     except Exception as e:
         if "duplicate column" not in str(e).lower():
             raise
+    # Whether this specific booking redeemed one of the customer's earned
+    # loyalty free-cuts (see loyalty_free_earned below). Kept per-appointment,
+    # same reasoning as credit_applied_cents, so the owner can always see
+    # exactly which past bookings were free and why - and so the money
+    # counter on the Customers page can leave them out of revenue even
+    # after the customer's free-cut balance has moved on.
+    try:
+        conn.execute("ALTER TABLE appointments ADD COLUMN used_free_reward INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+    except Exception as e:
+        if "duplicate column" not in str(e).lower():
+            raise
     # Owner-controlled loyalty punch card: the owner manually checks off
     # each haircut (Customer Punches tab) instead of it being counted
     # automatically just for being booked. loyalty_checked marks whether
@@ -366,6 +378,21 @@ def _generate_referral_code(name):
 
 def format_cents(cents):
     return f"${cents / 100:.2f}".rstrip("0").rstrip(".") if cents % 100 == 0 else f"${cents / 100:.2f}"
+
+
+def format_price_or_free(price, used_free_reward):
+    """HTML for a price that shows the normal price struck through with a
+    gold FREE! badge when this specific booking redeemed a loyalty
+    free-cut (used_free_reward = 1) — used everywhere a booked
+    appointment's price is displayed, to both the customer and the
+    owner, so a redeemed free-cut never quietly looks like a normal
+    priced booking. Plain price text otherwise."""
+    if used_free_reward:
+        return (
+            f'<span style="text-decoration:line-through; color:#847f72;">{price}</span> '
+            '<span class="free-badge">FREE!</span>'
+        )
+    return price
 
 
 def create_user(name, email, phone, password, referral_code_used=None):
@@ -495,7 +522,27 @@ def get_pending_appointment(user_id):
     ).fetchone()
 
 
-def create_appointment(user_id, service_key, appt_date, appt_time, notes, credit_cents_to_apply=0):
+def consume_free_reward(user_id):
+    """Atomically claims one of this customer's earned loyalty free-cuts
+    for the booking currently being created. Re-checked here (not just
+    trusted from what the booking page showed) for the same reason the
+    slot conflict and pending-appointment checks are re-checked at write
+    time: two tabs, or a stale page, could otherwise let the same free
+    cut get used twice. Returns True if a free cut was actually available
+    and has now been spent; False if there wasn't one."""
+    conn = get_conn()
+    row = conn.execute("SELECT loyalty_free_earned FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not row or not row[0]:
+        return False
+    conn.execute(
+        "UPDATE users SET loyalty_free_earned = loyalty_free_earned - 1 WHERE id = ?",
+        (user_id,),
+    )
+    conn.commit()
+    return True
+
+
+def create_appointment(user_id, service_key, appt_date, appt_time, notes, credit_cents_to_apply=0, use_free_reward=False):
     """Returns (ok, message). Re-checks the slot at write time (not just what
     the picker showed) so two people submitting at nearly the same moment
     can't both land the same slot. credit_cents_to_apply (referral credit)
@@ -505,7 +552,15 @@ def create_appointment(user_id, service_key, appt_date, appt_time, notes, credit
     (at write time, same reasoning as the slot check) that this customer
     doesn't already have a haircut that hasn't been given yet — see
     get_pending_appointment — so nobody can queue up a second booking
-    before their current one is checked off."""
+    before their current one is checked off.
+
+    use_free_reward=True redeems one earned loyalty free-cut instead of
+    charging the normal price: the appointment is stored with its usual
+    service/price (so duration and labeling stay correct), but flagged
+    used_free_reward = 1 so the booking page, the owner's views, and the
+    revenue counter all know to show/treat it as $0. Referral credit and
+    a free reward are never combined - a free cut already covers the full
+    price, so any credit_cents_to_apply is ignored when this is set."""
     conn = get_conn()
     if get_pending_appointment(user_id):
         return False, (
@@ -518,13 +573,17 @@ def create_appointment(user_id, service_key, appt_date, appt_time, notes, credit
     ).fetchone()
     if conflict:
         return False, "Sorry - that time slot was just booked by someone else. Please pick another."
+    if use_free_reward:
+        if not consume_free_reward(user_id):
+            return False, "That free haircut isn't available anymore - please refresh and try again."
+        credit_cents_to_apply = 0
     service = SERVICES[service_key]
     conn.execute(
-        "INSERT INTO appointments (user_id, service, price, appt_date, appt_time, notes, status, created_at, credit_applied_cents) "
-        "VALUES (?, ?, ?, ?, ?, ?, 'Confirmed', ?, ?)",
+        "INSERT INTO appointments (user_id, service, price, appt_date, appt_time, notes, status, created_at, credit_applied_cents, used_free_reward) "
+        "VALUES (?, ?, ?, ?, ?, ?, 'Confirmed', ?, ?, ?)",
         (
             user_id, service["label"], service["price"], appt_date.isoformat(), appt_time,
-            notes.strip(), datetime.now().isoformat(), credit_cents_to_apply,
+            notes.strip(), datetime.now().isoformat(), credit_cents_to_apply, int(use_free_reward),
         ),
     )
     if credit_cents_to_apply:
@@ -586,7 +645,7 @@ def _get_unchecked_appointments_cached():
     conn = get_conn()
     rows = conn.execute(
         """
-        SELECT a.id, a.service, a.price, a.appt_date, a.appt_time, u.id, u.name
+        SELECT a.id, a.service, a.price, a.appt_date, a.appt_time, u.id, u.name, a.used_free_reward
         FROM appointments a
         JOIN users u ON u.id = a.user_id
         WHERE a.status = 'Confirmed' AND a.loyalty_checked = 0
@@ -741,7 +800,7 @@ def dismiss_loyalty_appt(appt_id):
 def _get_appointments_cached(user_id):
     conn = get_conn()
     rows = conn.execute(
-        "SELECT id, service, price, appt_date, appt_time, notes, status FROM appointments "
+        "SELECT id, service, price, appt_date, appt_time, notes, status, used_free_reward FROM appointments "
         "WHERE user_id = ? ORDER BY appt_date ASC, appt_time ASC",
         (user_id,),
     ).fetchall()
@@ -862,7 +921,7 @@ def _get_all_appointments_cached():
     rows = conn.execute(
         """
         SELECT a.id, a.service, a.price, a.appt_date, a.appt_time, a.notes, a.status,
-               u.name, u.phone, u.email
+               u.name, u.phone, u.email, a.used_free_reward
         FROM appointments a
         JOIN users u ON u.id = a.user_id
         ORDER BY a.appt_date ASC, a.appt_time ASC
@@ -976,10 +1035,15 @@ def get_cut_revenue_stats():
     actually checked off on Customer Punches — rather than just status =
     'Confirmed', since Confirmed only means booked/not-cancelled and can
     include cuts that haven't happened yet. loyalty_checked is the real
-    proof a cut was given."""
+    proof a cut was given.
+
+    A cut redeemed with a loyalty free-cut (used_free_reward = 1) still
+    counts toward "Total Cuts" and its own "free" bucket — the owner did
+    give the haircut — but contributes $0 to revenue, since no money
+    actually changed hands for it."""
     conn = get_conn()
     rows = conn.execute(
-        "SELECT price, appt_date FROM appointments WHERE loyalty_checked = 1"
+        "SELECT price, appt_date, used_free_reward FROM appointments WHERE loyalty_checked = 1"
     ).fetchall()
 
     today = date.today()
@@ -987,19 +1051,21 @@ def get_cut_revenue_stats():
     month_start_iso = today.replace(day=1).isoformat()
 
     def empty_bucket():
-        return {"total": 0, "ten": 0, "fifteen": 0, "revenue_cents": 0}
+        return {"total": 0, "ten": 0, "fifteen": 0, "free": 0, "revenue_cents": 0}
 
     buckets = {"week": empty_bucket(), "month": empty_bucket(), "all": empty_bucket()}
 
     price_to_cents = {"$10": 1000, "$15": 1500}
-    for price, appt_date_str in rows:
-        cents = price_to_cents.get(price, 0)
+    for price, appt_date_str, used_free_reward in rows:
+        cents = 0 if used_free_reward else price_to_cents.get(price, 0)
         for key, start_iso in (("week", week_start_iso), ("month", month_start_iso), ("all", None)):
             if start_iso is None or appt_date_str >= start_iso:
                 b = buckets[key]
                 b["total"] += 1
                 b["revenue_cents"] += cents
-                if price == "$10":
+                if used_free_reward:
+                    b["free"] += 1
+                elif price == "$10":
                     b["ten"] += 1
                 elif price == "$15":
                     b["fifteen"] += 1
@@ -2355,6 +2421,30 @@ raw_html(
         letter-spacing:0.3px;
         padding:6px 13px;
         border-radius:6px;
+    }
+
+    /* ---------- FREE BADGE ----------
+       Small celebratory tag shown wherever a booking's price is $0 —
+       either a redeemed loyalty free-cut or referral credit that fully
+       covers the price. Deliberately louder than .gold-tag (a little
+       bounce) so it reads as a reward, not just another price label. */
+    @keyframes free-badge-pop{
+        0%{ transform:scale(0.7); opacity:0; }
+        60%{ transform:scale(1.12); opacity:1; }
+        100%{ transform:scale(1); }
+    }
+    .free-badge{
+        display:inline-block;
+        background:linear-gradient(120deg, #F1D98B, #D4AF37 55%, #a67c1f);
+        color:var(--premium-black) !important;
+        font-weight:800;
+        font-style:normal;
+        font-size:0.85rem;
+        letter-spacing:0.5px;
+        padding:5px 12px;
+        border-radius:999px;
+        box-shadow:0 0 14px rgba(212,175,55,0.55);
+        animation:free-badge-pop 0.45s cubic-bezier(.34,1.56,.64,1);
     }
 
     .st-key-pricing_cta{
@@ -3725,7 +3815,20 @@ def render_book_now():
                 # refresh the moment the Date changes, so it only ever offers
                 # slots nobody else has already taken that day.
                 with st.container(key="booking_widget"):
+                    # An earned loyalty free-cut (see loyalty_free_earned)
+                    # makes THIS booking $0 outright, regardless of which
+                    # service is picked — shown up front on the service
+                    # cards and locked in below, ahead of the referral
+                    # credit option (a free cut already covers everything,
+                    # so there's nothing left for credit to apply to).
+                    free_reward_available = get_loyalty_state(user["id"])[1] > 0
+
                     raw_html('<div class="booking-step-label"><span class="step-num">1</span>Choose Your Service</div>')
+                    if free_reward_available:
+                        raw_html(
+                            '<p style="color:#F1D98B; font-weight:600; margin:-4px 0 14px 0;">'
+                            '🎉 You have a free haircut earned — pick any service below and it\'s on the house.</p>'
+                        )
 
                     # Visual service cards (image + price + duration) instead of
                     # a plain dropdown. Reuses the Pricing page's already-cached
@@ -3742,6 +3845,12 @@ def render_book_now():
                     card_cols = st.columns(2)
                     for (skey, simg, sprice, sdur), scol in zip(SERVICE_CARDS, card_cols):
                         selected = skey == service_key
+                        price_display = (
+                            f'<span style="text-decoration:line-through; color:#847f72; font-size:0.85em;">{sprice}</span> '
+                            '<span class="free-badge">FREE!</span>'
+                            if free_reward_available
+                            else sprice
+                        )
                         with scol:
                             raw_html(
                                 f"""
@@ -3750,7 +3859,7 @@ def render_book_now():
                                     <div class="service-card-body">
                                         {'<div class="service-card-check">✓</div>' if selected else ''}
                                         <div class="service-card-name">{SERVICES[skey]['label']}</div>
-                                        <div class="service-card-price">{sprice}</div>
+                                        <div class="service-card-price">{price_display}</div>
                                         <span class="chip">{sdur}</span>
                                     </div>
                                 </div>
@@ -3803,7 +3912,7 @@ def render_book_now():
 
                     credit_cents = get_credit_cents(user["id"]) if user["id"] else 0
                     credit_to_apply = 0
-                    if credit_cents > 0 and service_key:
+                    if credit_cents > 0 and service_key and not free_reward_available:
                         service_price_cents = SERVICE_PRICE_CENTS[service_key]
                         max_applicable = min(credit_cents, service_price_cents)
                         apply_credit = st.checkbox(
@@ -3816,12 +3925,18 @@ def render_book_now():
 
                     if appt_time is not None:
                         pretty_selected_date = appt_date.strftime("%a, %b %d, %Y")
-                        final_price_cents = max(0, SERVICE_PRICE_CENTS[service_key] - credit_to_apply)
-                        price_line = (
-                            f"<span style='text-decoration:line-through; color:#847f72; margin-right:6px;'>{SERVICES[service_key]['price']}</span>{format_cents(final_price_cents)}"
-                            if credit_to_apply
-                            else SERVICES[service_key]['price']
-                        )
+                        if free_reward_available:
+                            price_line = (
+                                f"<span style='text-decoration:line-through; color:#847f72; margin-right:6px;'>{SERVICES[service_key]['price']}</span>"
+                                '<span class="free-badge">FREE!</span>'
+                            )
+                        else:
+                            final_price_cents = max(0, SERVICE_PRICE_CENTS[service_key] - credit_to_apply)
+                            price_line = (
+                                f"<span style='text-decoration:line-through; color:#847f72; margin-right:6px;'>{SERVICES[service_key]['price']}</span>{format_cents(final_price_cents)}"
+                                if credit_to_apply
+                                else SERVICES[service_key]['price']
+                            )
                         raw_html(
                             f"""
                             <div class="booking-summary">
@@ -3839,6 +3954,7 @@ def render_book_now():
                                 ok, msg = create_appointment(
                                     user["id"], service_key, appt_date, appt_time, notes or "",
                                     credit_cents_to_apply=credit_to_apply,
+                                    use_free_reward=free_reward_available,
                                 )
                             if ok:
                                 # Stashed instead of an immediate st.success() +
@@ -3873,13 +3989,14 @@ def render_book_now():
                     st.session_state.editing_appt_id = None
 
                 def render_appt_row(appt):
-                    appt_id, service, price, appt_date_str, appt_time_str, appt_notes, status = appt
+                    appt_id, service, price, appt_date_str, appt_time_str, appt_notes, status, used_free_reward = appt
                     pretty_date = datetime.strptime(appt_date_str, "%Y-%m-%d").strftime("%b %d, %Y")
+                    price_html = format_price_or_free(price, used_free_reward)
                     raw_html(
                         f"""
                         <div class="appt-card">
                             <div>
-                                <div class="appt-service">{service} · {price}</div>
+                                <div class="appt-service">{service} · {price_html}</div>
                                 <div class="appt-meta"><span class="gold-tag">{pretty_date} at {appt_time_str}</span></div>
                             </div>
                             <div class="status-pill status-{status}">{status}</div>
@@ -4263,15 +4380,16 @@ def render_my_schedule():
                 unsafe_allow_html=True,
             )
         else:
-            for appt_id, service, price, appt_date_str, appt_time_str, notes, status, cust_name, cust_phone, cust_email in day_appts:
+            for appt_id, service, price, appt_date_str, appt_time_str, notes, status, cust_name, cust_phone, cust_email, used_free_reward in day_appts:
                 contact = cust_phone or cust_email or ""
+                price_bit = "FREE!" if used_free_reward else price
                 raw_html(
                     f"""
                     <div class="admin-appt-row">
                         <div class="admin-appt-time">{appt_time_str}</div>
                         <div style="flex:1; min-width:160px;">
                             <div class="admin-appt-cust">{cust_name}</div>
-                            <div class="admin-appt-service"><span class="gold-tag">{service} · {price}{" · " + contact if contact else ""}</span></div>
+                            <div class="admin-appt-service"><span class="gold-tag">{service} · {price_bit}{" · " + contact if contact else ""}</span></div>
                         </div>
                     </div>
                     """
@@ -4290,9 +4408,10 @@ def render_my_schedule():
             if "admin_editing_appt_id" not in st.session_state:
                 st.session_state.admin_editing_appt_id = None
 
-            for appt_id, service, price, appt_date_str, appt_time_str, notes, status, cust_name, cust_phone, cust_email in upcoming:
+            for appt_id, service, price, appt_date_str, appt_time_str, notes, status, cust_name, cust_phone, cust_email, used_free_reward in upcoming:
                 pretty_date = datetime.strptime(appt_date_str, "%Y-%m-%d").strftime("%b %d, %Y")
                 contact = cust_phone or cust_email or ""
+                price_bit = "FREE!" if used_free_reward else price
                 # Collapsed by default — tap to expand and reveal the
                 # actions, instead of every row showing 3 buttons at once
                 # (which made a long list hard to scan/use).
@@ -4303,7 +4422,7 @@ def render_my_schedule():
                             <div class="admin-appt-time">{pretty_date}<br>{appt_time_str}</div>
                             <div style="flex:1; min-width:160px;">
                                 <div class="admin-appt-cust">{cust_name}</div>
-                                <div class="admin-appt-service"><span class="gold-tag">{service} · {price}{" · " + contact if contact else ""}</span></div>
+                                <div class="admin-appt-service"><span class="gold-tag">{service} · {price_bit}{" · " + contact if contact else ""}</span></div>
                             </div>
                         </div>
                         """
@@ -4439,14 +4558,19 @@ def render_admin_punches():
                 """
             )
         else:
-            for appt_id, service, price, appt_date_str, appt_time_str, cust_user_id, cust_name in unchecked:
+            for appt_id, service, price, appt_date_str, appt_time_str, cust_user_id, cust_name, used_free_reward in unchecked:
                 pretty_date = datetime.strptime(appt_date_str, "%Y-%m-%d").strftime("%b %d, %Y")
+                meta_html = (
+                    f'<span class="gold-tag">{pretty_date} at {appt_time_str}</span> <span class="free-badge">FREE!</span>'
+                    if used_free_reward
+                    else f'<span class="gold-tag">{pretty_date} at {appt_time_str} · {price}</span>'
+                )
                 raw_html(
                     f"""
                     <div class="appt-card">
                         <div>
                             <div class="appt-service">{cust_name} — {service}</div>
-                            <div class="appt-meta"><span class="gold-tag">{pretty_date} at {appt_time_str} · {price}</span></div>
+                            <div class="appt-meta">{meta_html}</div>
                         </div>
                     </div>
                     """
@@ -4528,13 +4652,14 @@ def render_customers():
                             unsafe_allow_html=True,
                         )
                     else:
-                        for _appt_id, service, price, appt_date_str, appt_time_str, _notes, status in cust_appts:
+                        for _appt_id, service, price, appt_date_str, appt_time_str, _notes, status, used_free_reward in cust_appts:
                             pretty_date = datetime.strptime(appt_date_str, "%Y-%m-%d").strftime("%b %d, %Y")
+                            price_html = format_price_or_free(price, used_free_reward)
                             raw_html(
                                 f"""
                                 <div class="appt-card">
                                     <div>
-                                        <div class="appt-service">{service} · {price}</div>
+                                        <div class="appt-service">{service} · {price_html}</div>
                                         <div class="appt-meta"><span class="gold-tag">{pretty_date} at {appt_time_str}</span></div>
                                     </div>
                                     <div class="status-pill status-{status}">{status}</div>
