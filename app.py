@@ -3700,14 +3700,15 @@ def render_book_now():
                     title = "You're All Set!"
                     sub = (
                         f"{p_service} on {pretty_date} at {p_time} · {p_price} is booked. "
-                        "You can book your next haircut once this one's done."
+                        "You can book your next haircut once this one's done. Need to change "
+                        "or cancel it? See it below."
                     )
                 else:
                     title = "You've already got one on the books"
                     sub = (
                         f"{p_service} on {pretty_date} at {p_time} · {p_price} hasn't happened yet. "
-                        "You can book your next haircut once this one's done — or cancel it below "
-                        "first if your plans changed."
+                        "You can book your next haircut once this one's done — or cancel or "
+                        "reschedule it below first if your plans changed."
                     )
                 raw_html(
                     f"""
@@ -3717,155 +3718,148 @@ def render_book_now():
                     </div>
                     """
                 )
-                st.button(
-                    "View / Cancel in Your Appointments →",
-                    key="book_now_go_appointments",
-                    use_container_width=True,
-                    on_click=go_to,
-                    args=("Your Appointments",),
-                )
-                st.markdown("<div style='height:60px;'></div>", unsafe_allow_html=True)
-                return
+                st.markdown("<div style='height:24px;'></div>", unsafe_allow_html=True)
 
-            # Not wrapped in st.form on purpose: the Time dropdown needs to
-            # refresh the moment the Date changes, so it only ever offers
-            # slots nobody else has already taken that day.
-            with st.container(key="booking_widget"):
-                raw_html('<div class="booking-step-label"><span class="step-num">1</span>Choose Your Service</div>')
+            if not pending:
+                # Not wrapped in st.form on purpose: the Time dropdown needs to
+                # refresh the moment the Date changes, so it only ever offers
+                # slots nobody else has already taken that day.
+                with st.container(key="booking_widget"):
+                    raw_html('<div class="booking-step-label"><span class="step-num">1</span>Choose Your Service</div>')
 
-                # Visual service cards (image + price + duration) instead of
-                # a plain dropdown. Reuses the Pricing page's already-cached
-                # images, so this costs nothing extra to load.
-                SERVICE_CARDS = [
-                    ("Fade or Trim - $10 (30 min)", IMG_PRICE_10, "$10", "30 min"),
-                    ("Full Haircut - $15 (1 hour)", IMG_PRICE_15, "$15", "1 hour"),
-                ]
-                preselected = st.session_state.pop("preselect_service", None)
-                if "booking_service_choice" not in st.session_state or preselected:
-                    st.session_state.booking_service_choice = preselected or SERVICE_CARDS[0][0]
-                service_key = st.session_state.booking_service_choice
+                    # Visual service cards (image + price + duration) instead of
+                    # a plain dropdown. Reuses the Pricing page's already-cached
+                    # images, so this costs nothing extra to load.
+                    SERVICE_CARDS = [
+                        ("Fade or Trim - $10 (30 min)", IMG_PRICE_10, "$10", "30 min"),
+                        ("Full Haircut - $15 (1 hour)", IMG_PRICE_15, "$15", "1 hour"),
+                    ]
+                    preselected = st.session_state.pop("preselect_service", None)
+                    if "booking_service_choice" not in st.session_state or preselected:
+                        st.session_state.booking_service_choice = preselected or SERVICE_CARDS[0][0]
+                    service_key = st.session_state.booking_service_choice
 
-                card_cols = st.columns(2)
-                for (skey, simg, sprice, sdur), scol in zip(SERVICE_CARDS, card_cols):
-                    selected = skey == service_key
-                    with scol:
+                    card_cols = st.columns(2)
+                    for (skey, simg, sprice, sdur), scol in zip(SERVICE_CARDS, card_cols):
+                        selected = skey == service_key
+                        with scol:
+                            raw_html(
+                                f"""
+                                <div class="service-card{' selected' if selected else ''}">
+                                    <div class="service-card-img" style="background-image:url('{simg}');"></div>
+                                    <div class="service-card-body">
+                                        {'<div class="service-card-check">✓</div>' if selected else ''}
+                                        <div class="service-card-name">{SERVICES[skey]['label']}</div>
+                                        <div class="service-card-price">{sprice}</div>
+                                        <span class="chip">{sdur}</span>
+                                    </div>
+                                </div>
+                                """
+                            )
+                            st.button(
+                                "Selected ✓" if selected else "Choose This",
+                                key=f"pick_{skey}",
+                                type="primary" if selected else "secondary",
+                                use_container_width=True,
+                                on_click=set_booking_service,
+                                args=(skey,),
+                            )
+
+                    raw_html('<div class="booking-step-label"><span class="step-num">2</span>Pick a Date &amp; Time</div>')
+                    col_a, col_b = st.columns(2)
+                    with col_a:
+                        appt_date = st.date_input(
+                            "Date",
+                            min_value=date.today(),
+                            max_value=date.today() + timedelta(days=60),
+                            value=date.today(),
+                            key="booking_date",
+                        )
+                    with col_b:
+                        booked_times = get_booked_times(appt_date.isoformat())
+                        day_slots = time_slots_for_date(appt_date)
+                        available_times = [t for t in day_slots if t not in booked_times]
+                        if not day_slots:
+                            appt_time = None
+                            st.selectbox(
+                                "Time",
+                                ["Closed that day - pick another date"],
+                                disabled=True,
+                                key="booking_time_closed",
+                            )
+                        elif available_times:
+                            appt_time = st.selectbox("Time", available_times, key="booking_time")
+                        else:
+                            appt_time = None
+                            st.selectbox(
+                                "Time",
+                                ["Fully booked - pick another day"],
+                                disabled=True,
+                                key="booking_time_full",
+                            )
+
+                    raw_html('<div class="booking-step-label"><span class="step-num">3</span>Anything We Should Know?</div>')
+                    notes = st.text_area("Notes (optional)", placeholder="Anything the barber should know", key="booking_notes", label_visibility="collapsed")
+
+                    credit_cents = get_credit_cents(user["id"]) if user["id"] else 0
+                    credit_to_apply = 0
+                    if credit_cents > 0 and service_key:
+                        service_price_cents = SERVICE_PRICE_CENTS[service_key]
+                        max_applicable = min(credit_cents, service_price_cents)
+                        apply_credit = st.checkbox(
+                            f"Apply my {format_cents(credit_cents)} referral credit to this booking",
+                            key="apply_credit_checkbox",
+                            value=True,
+                        )
+                        if apply_credit:
+                            credit_to_apply = max_applicable
+
+                    if appt_time is not None:
+                        pretty_selected_date = appt_date.strftime("%a, %b %d, %Y")
+                        final_price_cents = max(0, SERVICE_PRICE_CENTS[service_key] - credit_to_apply)
+                        price_line = (
+                            f"<span style='text-decoration:line-through; color:#847f72; margin-right:6px;'>{SERVICES[service_key]['price']}</span>{format_cents(final_price_cents)}"
+                            if credit_to_apply
+                            else SERVICES[service_key]['price']
+                        )
                         raw_html(
                             f"""
-                            <div class="service-card{' selected' if selected else ''}">
-                                <div class="service-card-img" style="background-image:url('{simg}');"></div>
-                                <div class="service-card-body">
-                                    {'<div class="service-card-check">✓</div>' if selected else ''}
-                                    <div class="service-card-name">{SERVICES[skey]['label']}</div>
-                                    <div class="service-card-price">{sprice}</div>
-                                    <span class="chip">{sdur}</span>
-                                </div>
+                            <div class="booking-summary">
+                                <div class="booking-summary-label">You're About To Book</div>
+                                <div class="booking-summary-line">{SERVICES[service_key]['label']} · {price_line} — {pretty_selected_date} at {appt_time}</div>
                             </div>
                             """
                         )
-                        st.button(
-                            "Selected ✓" if selected else "Choose This",
-                            key=f"pick_{skey}",
-                            type="primary" if selected else "secondary",
-                            use_container_width=True,
-                            on_click=set_booking_service,
-                            args=(skey,),
-                        )
 
-                raw_html('<div class="booking-step-label"><span class="step-num">2</span>Pick a Date &amp; Time</div>')
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    appt_date = st.date_input(
-                        "Date",
-                        min_value=date.today(),
-                        max_value=date.today() + timedelta(days=60),
-                        value=date.today(),
-                        key="booking_date",
-                    )
-                with col_b:
-                    booked_times = get_booked_times(appt_date.isoformat())
-                    day_slots = time_slots_for_date(appt_date)
-                    available_times = [t for t in day_slots if t not in booked_times]
-                    if not day_slots:
-                        appt_time = None
-                        st.selectbox(
-                            "Time",
-                            ["Closed that day - pick another date"],
-                            disabled=True,
-                            key="booking_time_closed",
-                        )
-                    elif available_times:
-                        appt_time = st.selectbox("Time", available_times, key="booking_time")
-                    else:
-                        appt_time = None
-                        st.selectbox(
-                            "Time",
-                            ["Fully booked - pick another day"],
-                            disabled=True,
-                            key="booking_time_full",
-                        )
-
-                raw_html('<div class="booking-step-label"><span class="step-num">3</span>Anything We Should Know?</div>')
-                notes = st.text_area("Notes (optional)", placeholder="Anything the barber should know", key="booking_notes", label_visibility="collapsed")
-
-                credit_cents = get_credit_cents(user["id"]) if user["id"] else 0
-                credit_to_apply = 0
-                if credit_cents > 0 and service_key:
-                    service_price_cents = SERVICE_PRICE_CENTS[service_key]
-                    max_applicable = min(credit_cents, service_price_cents)
-                    apply_credit = st.checkbox(
-                        f"Apply my {format_cents(credit_cents)} referral credit to this booking",
-                        key="apply_credit_checkbox",
-                        value=True,
-                    )
-                    if apply_credit:
-                        credit_to_apply = max_applicable
-
-                if appt_time is not None:
-                    pretty_selected_date = appt_date.strftime("%a, %b %d, %Y")
-                    final_price_cents = max(0, SERVICE_PRICE_CENTS[service_key] - credit_to_apply)
-                    price_line = (
-                        f"<span style='text-decoration:line-through; color:#847f72; margin-right:6px;'>{SERVICES[service_key]['price']}</span>{format_cents(final_price_cents)}"
-                        if credit_to_apply
-                        else SERVICES[service_key]['price']
-                    )
-                    raw_html(
-                        f"""
-                        <div class="booking-summary">
-                            <div class="booking-summary-label">You're About To Book</div>
-                            <div class="booking-summary-line">{SERVICES[service_key]['label']} · {price_line} — {pretty_selected_date} at {appt_time}</div>
-                        </div>
-                        """
-                    )
-
-                if st.button("Confirm Appointment", key="booking_confirm_btn", type="primary", use_container_width=True):
-                    if appt_time is None:
-                        st.error("That day is fully booked - please choose another date.")
-                    else:
-                        with st.spinner("Booking your appointment..."):
-                            ok, msg = create_appointment(
-                                user["id"], service_key, appt_date, appt_time, notes or "",
-                                credit_cents_to_apply=credit_to_apply,
-                            )
-                        if ok:
-                            # Stashed instead of an immediate st.success() +
-                            # st.rerun(): that combo used to show the toast
-                            # for a single frame before the rerun wiped it,
-                            # then land the customer on the "you already
-                            # have an appointment" guard card with zero
-                            # acknowledgment that THIS booking was the one
-                            # that just went through. Stashing it lets the
-                            # next run show a proper full-screen checkmark
-                            # first (render_booking_success_overlay) and
-                            # word that guard card as a confirmation instead
-                            # of a block.
-                            st.session_state.booking_success_info = {
-                                "service": SERVICES[service_key]["label"],
-                                "date": appt_date.strftime("%a, %b %d, %Y"),
-                                "time": appt_time,
-                            }
-                            st.rerun()
+                    if st.button("Confirm Appointment", key="booking_confirm_btn", type="primary", use_container_width=True):
+                        if appt_time is None:
+                            st.error("That day is fully booked - please choose another date.")
                         else:
-                            st.error(msg)
+                            with st.spinner("Booking your appointment..."):
+                                ok, msg = create_appointment(
+                                    user["id"], service_key, appt_date, appt_time, notes or "",
+                                    credit_cents_to_apply=credit_to_apply,
+                                )
+                            if ok:
+                                # Stashed instead of an immediate st.success() +
+                                # st.rerun(): that combo used to show the toast
+                                # for a single frame before the rerun wiped it,
+                                # then land the customer on the "you already
+                                # have an appointment" guard card with zero
+                                # acknowledgment that THIS booking was the one
+                                # that just went through. Stashing it lets the
+                                # next run show a proper full-screen checkmark
+                                # first (render_booking_success_overlay) and
+                                # word that guard card as a confirmation instead
+                                # of a block.
+                                st.session_state.booking_success_info = {
+                                    "service": SERVICES[service_key]["label"],
+                                    "date": appt_date.strftime("%a, %b %d, %Y"),
+                                    "time": appt_time,
+                                }
+                                st.rerun()
+                            else:
+                                st.error(msg)
 
             appts = get_appointments(user["id"])
             if not appts:
