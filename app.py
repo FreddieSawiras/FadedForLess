@@ -2,6 +2,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 import libsql
 import hashlib
+import json
 import os
 import re
 import random
@@ -479,14 +480,38 @@ def get_booked_times(appt_date_iso, exclude_appt_id=None):
     return {r[0] for r in rows if r[1] != exclude_appt_id}
 
 
+def get_pending_appointment(user_id):
+    """The customer's one active, not-yet-given haircut, if any: a
+    Confirmed appointment the owner hasn't checked off yet on Customer
+    Punches (loyalty_checked = 0). Used to block a customer from booking
+    a second haircut before their first one is actually done. Returns
+    (id, service, price, appt_date, appt_time) or None."""
+    conn = get_conn()
+    return conn.execute(
+        "SELECT id, service, price, appt_date, appt_time FROM appointments "
+        "WHERE user_id = ? AND status = 'Confirmed' AND loyalty_checked = 0 "
+        "ORDER BY appt_date ASC, appt_time ASC LIMIT 1",
+        (user_id,),
+    ).fetchone()
+
+
 def create_appointment(user_id, service_key, appt_date, appt_time, notes, credit_cents_to_apply=0):
     """Returns (ok, message). Re-checks the slot at write time (not just what
     the picker showed) so two people submitting at nearly the same moment
     can't both land the same slot. credit_cents_to_apply (referral credit)
     is recorded on the appointment and deducted from the user's balance -
     the owner honors the discount in person, same as every other price on
-    this site (there's no live payment processing here)."""
+    this site (there's no live payment processing here). Also re-checks
+    (at write time, same reasoning as the slot check) that this customer
+    doesn't already have a haircut that hasn't been given yet — see
+    get_pending_appointment — so nobody can queue up a second booking
+    before their current one is checked off."""
     conn = get_conn()
+    if get_pending_appointment(user_id):
+        return False, (
+            "You already have an upcoming haircut on the books. You can book another "
+            "one once that one's done, or cancel it from Your Appointments first."
+        )
     conflict = conn.execute(
         "SELECT id FROM appointments WHERE appt_date = ? AND appt_time = ? AND status = 'Confirmed'",
         (appt_date.isoformat(), appt_time),
@@ -642,6 +667,7 @@ def mark_loyalty_checked(appt_id, user_id):
                     "your next visit.</p>"
                     "<p>- FADEDFORLESS</p>"
                 ),
+                wait=True,
             )
             send_email(
                 email,
@@ -652,6 +678,7 @@ def mark_loyalty_checked(appt_id, user_id):
                     f"signing up is now yours - <strong>$10 in credit</strong> toward your next visit.</p>"
                     "<p>- FADEDFORLESS</p>"
                 ),
+                wait=True,
             )
 
     # ---------- Punch email: every punch gets one, the free one gets a big one ----------
@@ -679,6 +706,7 @@ def mark_loyalty_checked(appt_id, user_id):
                 <p>- FADEDFORLESS</p>
                 """
             ),
+            wait=True,
         )
     else:
         remaining = LOYALTY_CYCLE - new_punches
@@ -692,6 +720,7 @@ def mark_loyalty_checked(appt_id, user_id):
                 f"{remaining} more cut{plural} until your next one is free.</p>"
                 "<p>- FADEDFORLESS</p>"
             ),
+            wait=True,
         )
 
     return reward_hit, referral_awarded
@@ -938,6 +967,178 @@ def get_customer_stats():
             }
         )
     return stats
+
+
+def get_cut_revenue_stats():
+    """Cut counts + revenue for the animated dashboard on the Customers
+    page, bucketed into this week (Mon-Sun), this calendar month, and
+    all-time. Based on loyalty_checked = 1 — an appointment the owner has
+    actually checked off on Customer Punches — rather than just status =
+    'Confirmed', since Confirmed only means booked/not-cancelled and can
+    include cuts that haven't happened yet. loyalty_checked is the real
+    proof a cut was given."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT price, appt_date FROM appointments WHERE loyalty_checked = 1"
+    ).fetchall()
+
+    today = date.today()
+    week_start_iso = (today - timedelta(days=today.weekday())).isoformat()
+    month_start_iso = today.replace(day=1).isoformat()
+
+    def empty_bucket():
+        return {"total": 0, "ten": 0, "fifteen": 0, "revenue_cents": 0}
+
+    buckets = {"week": empty_bucket(), "month": empty_bucket(), "all": empty_bucket()}
+
+    price_to_cents = {"$10": 1000, "$15": 1500}
+    for price, appt_date_str in rows:
+        cents = price_to_cents.get(price, 0)
+        for key, start_iso in (("week", week_start_iso), ("month", month_start_iso), ("all", None)):
+            if start_iso is None or appt_date_str >= start_iso:
+                b = buckets[key]
+                b["total"] += 1
+                b["revenue_cents"] += cents
+                if price == "$10":
+                    b["ten"] += 1
+                elif price == "$15":
+                    b["fifteen"] += 1
+    return buckets
+
+
+def render_cut_stats_widget(stats):
+    """The animated 'by the numbers' counter card on the owner's Customers
+    page — This Week / This Month / All Time tabs (switched client-side,
+    no rerun) with each number counting up smoothly on load or tab switch.
+    Pure HTML/CSS/JS in one self-contained component so it matches the
+    site's black-and-gold look without a Streamlit rerun round trip."""
+    payload = json.dumps(stats)
+    html = f"""
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@600;700;800&family=Inter:wght@400;500;600;700&display=swap');
+        .cs-wrap {{ font-family:'Inter', sans-serif; }}
+        .cs-card {{
+            background:linear-gradient(180deg, #141414, #0a0a0a);
+            border:1px solid rgba(212,175,55,0.35);
+            border-radius:16px;
+            padding:26px 22px 22px 22px;
+            box-shadow:0 0 40px rgba(212,175,55,0.06), inset 0 0 60px rgba(212,175,55,0.03);
+        }}
+        .cs-eyebrow {{
+            color:#D4AF37; font-size:11px; letter-spacing:2px; text-transform:uppercase;
+            text-align:center; margin-bottom:6px; font-weight:600;
+        }}
+        .cs-title {{
+            font-family:'Playfair Display', serif; color:#F1D98B; text-align:center;
+            font-size:22px; margin:0 0 18px 0;
+        }}
+        .cs-tabs {{ display:flex; justify-content:center; gap:8px; margin-bottom:22px; flex-wrap:wrap; }}
+        .cs-tab {{
+            background:transparent; border:1px solid rgba(212,175,55,0.4); color:#b8b3a8;
+            padding:7px 16px; border-radius:999px; font-size:12.5px; font-weight:600;
+            letter-spacing:0.5px; cursor:pointer; transition:all 0.25s ease;
+        }}
+        .cs-tab:hover {{ border-color:#D4AF37; color:#F1D98B; }}
+        .cs-tab.active {{
+            background:linear-gradient(120deg, #F1D98B, #D4AF37 60%, #a67c1f);
+            color:#0d0d0d; border-color:transparent;
+        }}
+        .cs-grid {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(130px, 1fr)); gap:14px; }}
+        .cs-tile {{
+            background:rgba(212,175,55,0.05); border:1px solid rgba(212,175,55,0.18);
+            border-radius:12px; padding:16px 10px; text-align:center;
+        }}
+        .cs-num {{
+            font-family:'Playfair Display', serif; font-weight:800; font-size:clamp(24px, 5vw, 34px);
+            background:linear-gradient(120deg, #F1D98B, #D4AF37 55%, #a67c1f);
+            -webkit-background-clip:text; background-clip:text; color:transparent;
+            line-height:1.1;
+        }}
+        .cs-label {{ color:#847f72; font-size:11.5px; text-transform:uppercase; letter-spacing:0.8px; margin-top:6px; }}
+        .cs-bar-wrap {{ margin-top:20px; }}
+        .cs-bar-labels {{ display:flex; justify-content:space-between; font-size:11.5px; color:#b8b3a8; margin-bottom:6px; }}
+        .cs-bar {{ height:8px; border-radius:999px; background:rgba(212,175,55,0.12); overflow:hidden; display:flex; }}
+        .cs-bar-seg-10 {{ background:linear-gradient(90deg, #a67c1f, #D4AF37); height:100%; transition:width 1s ease; width:0%; }}
+        .cs-bar-seg-15 {{ background:linear-gradient(90deg, #D4AF37, #F1D98B); height:100%; transition:width 1s ease; width:0%; }}
+    </style>
+    <div class="cs-wrap">
+      <div class="cs-card">
+        <div class="cs-eyebrow">FADEDFORLESS</div>
+        <div class="cs-title">By The Numbers</div>
+        <div class="cs-tabs">
+            <button class="cs-tab active" data-range="week">This Week</button>
+            <button class="cs-tab" data-range="month">This Month</button>
+            <button class="cs-tab" data-range="all">All Time</button>
+        </div>
+        <div class="cs-grid">
+            <div class="cs-tile"><div class="cs-num" id="cs-total">0</div><div class="cs-label">Total Cuts</div></div>
+            <div class="cs-tile"><div class="cs-num" id="cs-ten">0</div><div class="cs-label">$10 Cuts</div></div>
+            <div class="cs-tile"><div class="cs-num" id="cs-fifteen">0</div><div class="cs-label">$15 Cuts</div></div>
+            <div class="cs-tile"><div class="cs-num" id="cs-revenue">$0</div><div class="cs-label">Total Made</div></div>
+        </div>
+        <div class="cs-bar-wrap">
+            <div class="cs-bar-labels"><span>$10 cuts</span><span>$15 cuts</span></div>
+            <div class="cs-bar"><div class="cs-bar-seg-10" id="cs-bar10"></div><div class="cs-bar-seg-15" id="cs-bar15"></div></div>
+        </div>
+      </div>
+    </div>
+    <script>
+    (function() {{
+        const stats = {payload};
+        const els = {{
+            total: document.getElementById('cs-total'),
+            ten: document.getElementById('cs-ten'),
+            fifteen: document.getElementById('cs-fifteen'),
+            revenue: document.getElementById('cs-revenue'),
+            bar10: document.getElementById('cs-bar10'),
+            bar15: document.getElementById('cs-bar15'),
+        }};
+        const tabs = document.querySelectorAll('.cs-tab');
+        let raf = null;
+
+        function animateNumber(el, from, to, formatFn, duration) {{
+            const start = performance.now();
+            function step(now) {{
+                const t = Math.min(1, (now - start) / duration);
+                const eased = 1 - Math.pow(1 - t, 3);
+                const val = from + (to - from) * eased;
+                el.textContent = formatFn(val);
+                if (t < 1) requestAnimationFrame(step);
+                else el.textContent = formatFn(to);
+            }}
+            requestAnimationFrame(step);
+        }}
+
+        function fmtInt(v) {{ return Math.round(v).toLocaleString('en-US'); }}
+        function fmtMoney(v) {{ return '$' + Math.round(v).toLocaleString('en-US'); }}
+
+        function render(range) {{
+            const b = stats[range] || {{total:0, ten:0, fifteen:0, revenue_cents:0}};
+            const dollars = b.revenue_cents / 100;
+            animateNumber(els.total, 0, b.total, fmtInt, 900);
+            animateNumber(els.ten, 0, b.ten, fmtInt, 900);
+            animateNumber(els.fifteen, 0, b.fifteen, fmtInt, 900);
+            animateNumber(els.revenue, 0, dollars, fmtMoney, 1100);
+            const denom = Math.max(1, b.ten + b.fifteen);
+            requestAnimationFrame(() => {{
+                els.bar10.style.width = (100 * b.ten / denom) + '%';
+                els.bar15.style.width = (100 * b.fifteen / denom) + '%';
+            }});
+        }}
+
+        tabs.forEach(tab => {{
+            tab.addEventListener('click', () => {{
+                tabs.forEach(t => t.classList.remove('active'));
+                tab.classList.add('active');
+                render(tab.dataset.range);
+            }});
+        }});
+
+        render('week');
+    }})();
+    </script>
+    """
+    components.html(html, height=430)
 
 
 init_db()
@@ -1218,31 +1419,45 @@ def _send_email_background(to_email, subject, html_body):
     if not ok:
         # Most SMTP failures here are transient (a brief network blip, Gmail
         # momentarily rate-limiting) rather than permanent, so wait a bit and
-        # try once more before giving up — still nowhere near the "within 3
-        # minutes" target since this whole thing already runs off the
-        # critical path on a background thread.
-        time.sleep(20)
+        # try once more before giving up. Kept short (2s, not the old 20s)
+        # since this function now also runs synchronously (send_email(...,
+        # wait=True)) on paths where a real person is watching a spinner.
+        time.sleep(2)
         ok, error = _send_email_raw(to_email, subject, html_body)
         if not ok:
             print(f"[email] Failed to send to {to_email} after retry: {error}")
 
 
-def send_email(to_email, subject, html_body):
-    """Fires off one HTML email via Gmail SMTP on a background thread and
-    returns immediately. Every signup/booking/cancel/reschedule used to call
-    this 2x (customer + owner) *synchronously* — each SMTP round trip (SSL
-    handshake + login + send) can easily take 1-3 seconds, so actions like
-    "Create Account" or "Confirm Appointment" were blocking the whole page
-    for several seconds with zero visual feedback. That's what made the
-    button feel dead and invited a second click - and on signup specifically,
-    that second click landed the request AFTER the first one had already
-    gone through, so it hit the UNIQUE email constraint and showed "account
-    already exists" for an account that had, in fact, just been created
-    successfully. Backgrounding the send fixes both: the page responds
-    almost instantly, and email delivery (or a real failure, logged to the
-    server console) happens off the critical path. Fails silently from the
-    caller's perspective by design — a booking or signup should never be
-    blocked just because an email didn't go out."""
+def send_email(to_email, subject, html_body, wait=False):
+    """Fires off one HTML email via Gmail SMTP. Every signup/booking/cancel/
+    reschedule used to call this 2x (customer + owner) *synchronously* —
+    each SMTP round trip (SSL handshake + login + send) can easily take
+    1-3 seconds, so actions like "Create Account" or "Confirm Appointment"
+    were blocking the whole page for several seconds with zero visual
+    feedback. That's what made the button feel dead and invited a second
+    click - and on signup specifically, that second click landed the
+    request AFTER the first one had already gone through, so it hit the
+    UNIQUE email constraint and showed "account already exists" for an
+    account that had, in fact, just been created successfully.
+    Backgrounding the send (the default, wait=False) fixes both: the page
+    responds almost instantly, and email delivery (or a real failure,
+    logged to the server console) happens off the critical path. Fails
+    silently from the caller's perspective by design — a booking or
+    signup should never be blocked just because an email didn't go out.
+
+    wait=True sends synchronously instead (still with its own retry, see
+    _send_email_background). Use this for the loyalty-punch and referral
+    emails: those are low-volume, high-stakes ("you just earned $10" /
+    "your card moved"), and the owner is already staring at a spinner
+    when they fire — the extra 1-2 seconds is worth trading for actually
+    knowing the send finished before the page reruns out from under it.
+    A background thread has no such guarantee: Streamlit's own rerun (and,
+    on Streamlit Cloud, the app going idle/sleeping) can tear down the
+    process before a daemon thread's SMTP handshake completes, which is
+    why punch emails were going out inconsistently."""
+    if wait:
+        _send_email_background(to_email, subject, html_body)
+        return True
     threading.Thread(
         target=_send_email_background,
         args=(to_email, subject, html_body),
@@ -1358,6 +1573,38 @@ def build_ics_bytes_multi(events):
         + "END:VCALENDAR\r\n"
     )
     return ics.encode("utf-8")
+
+
+CALENDAR_EXPORT_STATE_KEY = "calendar_export_state"
+
+
+def _appt_export_fingerprint(appt):
+    """A short string that changes if anything about this appointment that
+    would matter in a calendar app changes (date, time, service, price,
+    status, or notes). Used to tell 'already downloaded, unchanged' apart
+    from 'new' or 'edited since the last download' for the owner's Add
+    Whole Calendar button. appt is a get_all_appointments() row:
+    (id, service, price, appt_date, appt_time, notes, status, name, phone, email)."""
+    _id, service, price, appt_date, appt_time, notes, status, *_ = appt
+    return "|".join([service, price, appt_date, appt_time, notes or "", status])
+
+
+def get_calendar_export_state():
+    """{appt_id (str): fingerprint} for every appointment included in the
+    owner's last 'Add Whole Calendar' download. Stored as JSON in the
+    existing settings table — no new table needed. Returns {} if the
+    owner has never downloaded a calendar export."""
+    raw = get_setting(CALENDAR_EXPORT_STATE_KEY, "")
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+
+
+def save_calendar_export_state(state):
+    set_setting(CALENDAR_EXPORT_STATE_KEY, json.dumps(state))
 
 
 def notify_signup(name, email, referral_applied=False):
@@ -3350,6 +3597,32 @@ def render_book_now():
                         st.session_state.user = None
                         st.rerun()
 
+            pending = get_pending_appointment(user["id"])
+            if pending:
+                _pid, p_service, p_price, p_date, p_time = pending
+                pretty_date = datetime.strptime(p_date, "%Y-%m-%d").strftime("%b %d, %Y")
+                raw_html(
+                    f"""
+                    <div class="appt-card" style="flex-direction:column; align-items:center; text-align:center; gap:6px; padding:36px 24px;">
+                        <div class="appt-service">You've already got one on the books</div>
+                        <p style="margin:6px 0 4px 0; color:#847f72;">
+                            {p_service} on {pretty_date} at {p_time} · {p_price} hasn't happened yet.
+                            You can book your next haircut once this one's done — or cancel it below
+                            first if your plans changed.
+                        </p>
+                    </div>
+                    """
+                )
+                st.button(
+                    "View / Cancel in Your Appointments →",
+                    key="book_now_go_appointments",
+                    use_container_width=True,
+                    on_click=go_to,
+                    args=("Your Appointments",),
+                )
+                st.markdown("<div style='height:60px;'></div>", unsafe_allow_html=True)
+                return
+
             # Not wrapped in st.form on purpose: the Time dropdown needs to
             # refresh the moment the Date changes, so it only ever offers
             # slots nobody else has already taken that day.
@@ -3752,24 +4025,64 @@ def render_my_schedule():
         today_iso = date.today().isoformat()
         upcoming_for_export = [a for a in active_appts if a[3] >= today_iso]
         if upcoming_for_export:
-            calendar_events = [
-                (
-                    f"{a[1]} - {a[7]} - FADEDFORLESS",
-                    a[3],
-                    a[4],
-                    a[2],
-                    f"Customer: {a[7]} ({a[8] or a[9] or ''})",
-                )
-                for a in upcoming_for_export
+            # Only re-download appointments that are brand new or have
+            # changed (date/time/service/price/status/notes) since the last
+            # time this button was actually clicked — unchanged appointments
+            # the owner already has in their calendar app are skipped.
+            # get_calendar_export_state() reads what was included last time
+            # (stored in the settings table); see save_calendar_export_state
+            # below for how it's updated.
+            export_state = get_calendar_export_state()
+            new_or_changed = [
+                a for a in upcoming_for_export
+                if export_state.get(str(a[0])) != _appt_export_fingerprint(a)
             ]
-            st.download_button(
-                f"📅 Add Whole Calendar to Your Calendar ({len(calendar_events)} appointments)",
-                data=build_ics_bytes_multi(calendar_events),
-                file_name=f"fadedforless-full-schedule-{today_iso}.ics",
-                mime="text/calendar",
-                key="admin_ics_all",
-                use_container_width=True,
-            )
+            full_resync = st.session_state.pop("calendar_force_full_resync", False)
+            appts_to_export = upcoming_for_export if full_resync else new_or_changed
+
+            if appts_to_export:
+                calendar_events = [
+                    (
+                        f"{a[1]} - {a[7]} - FADEDFORLESS",
+                        a[3],
+                        a[4],
+                        a[2],
+                        f"Customer: {a[7]} ({a[8] or a[9] or ''})",
+                    )
+                    for a in appts_to_export
+                ]
+                label = (
+                    f"📅 Add Whole Calendar to Your Calendar ({len(appts_to_export)} appointments)"
+                    if full_resync or not export_state
+                    else f"📅 Add New/Changed Appointments ({len(appts_to_export)})"
+                )
+                clicked = st.download_button(
+                    label,
+                    data=build_ics_bytes_multi(calendar_events),
+                    file_name=f"fadedforless-schedule-{today_iso}.ics",
+                    mime="text/calendar",
+                    key="admin_ics_all",
+                    use_container_width=True,
+                )
+                if clicked:
+                    # Record every currently-upcoming appointment (not just
+                    # the ones in this particular file) as "known" at its
+                    # current fingerprint, so the next download only ever
+                    # picks up genuinely new bookings or later edits.
+                    new_state = {str(a[0]): _appt_export_fingerprint(a) for a in upcoming_for_export}
+                    save_calendar_export_state(new_state)
+                skipped = len(upcoming_for_export) - len(appts_to_export)
+                if not full_resync and export_state and skipped:
+                    st.caption(f"{skipped} unchanged appointment(s) already in your calendar were skipped.")
+            else:
+                st.markdown(
+                    '<p style="color:#847f72;">Your calendar is already up to date - no new or '
+                    'changed appointments since your last download.</p>',
+                    unsafe_allow_html=True,
+                )
+                if st.button("Re-download everything anyway", key="calendar_force_full_resync_btn"):
+                    st.session_state.calendar_force_full_resync = True
+                    st.rerun()
             st.markdown("<div style='height:16px;'></div>", unsafe_allow_html=True)
 
         by_date = {}
@@ -4067,6 +4380,9 @@ def render_customers():
     )
     left2, mid2, right2 = st.columns([1, 2.6, 1])
     with mid2:
+        render_cut_stats_widget(get_cut_revenue_stats())
+        st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
+
         customer_stats = get_customer_stats()
         if not customer_stats:
             st.markdown(
