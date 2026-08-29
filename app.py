@@ -1141,6 +1141,97 @@ def render_cut_stats_widget(stats):
     components.html(html, height=430)
 
 
+def render_booking_success_overlay(details):
+    """Full-screen 'Appointment Booked!' moment: blurs everything behind it
+    and draws a gold checkmark in, then fades itself out a couple seconds
+    later. Injected into the *parent* document (same trick the footer's
+    scroll-reveal script uses) rather than drawn inside the components.html
+    iframe, since a fixed-position element inside that iframe would only
+    cover the iframe's own tiny box, not the actual page. Call this once,
+    right after a booking succeeds, before the page shows the customer
+    their now-existing appointment - without this, the very next thing
+    they'd see is a card saying 'you already have an appointment', which
+    reads as an error blocking a NEW booking rather than a confirmation of
+    the one they just made."""
+    service = details.get("service", "")
+    pretty_date = details.get("date", "")
+    appt_time = details.get("time", "")
+    html = f"""
+    <script>
+    (function() {{
+        const doc = window.parent.document;
+        const existing = doc.getElementById('ffl-booking-success-overlay');
+        if (existing) existing.remove();
+
+        const style = doc.createElement('style');
+        style.id = 'ffl-booking-success-style';
+        style.textContent = `
+            #ffl-booking-success-overlay {{
+                position: fixed; inset: 0; z-index: 999999;
+                display:flex; align-items:center; justify-content:center;
+                background: rgba(5,5,5,0.62);
+                backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+                opacity: 0; transition: opacity 0.35s ease;
+            }}
+            #ffl-booking-success-overlay.ffl-show {{ opacity: 1; }}
+            .ffl-success-card {{
+                background: linear-gradient(180deg, #141414, #0a0a0a);
+                border: 1px solid rgba(212,175,55,0.5);
+                border-radius: 20px; padding: 42px 48px; text-align:center;
+                box-shadow: 0 0 60px rgba(212,175,55,0.18);
+                transform: scale(0.85); transition: transform 0.4s cubic-bezier(.34,1.56,.64,1);
+                font-family: 'Inter', sans-serif; max-width:88vw;
+            }}
+            #ffl-booking-success-overlay.ffl-show .ffl-success-card {{ transform: scale(1); }}
+            .ffl-check-circle svg {{ width:76px; height:76px; }}
+            .ffl-check-circle circle {{
+                stroke:#D4AF37; stroke-width:3; fill:none;
+                stroke-dasharray:151; stroke-dashoffset:151;
+                animation: ffl-circle 0.6s ease forwards 0.1s;
+            }}
+            .ffl-check-circle path {{
+                stroke:#F1D98B; stroke-width:4; fill:none;
+                stroke-linecap:round; stroke-linejoin:round;
+                stroke-dasharray:40; stroke-dashoffset:40;
+                animation: ffl-check 0.4s ease forwards 0.55s;
+            }}
+            @keyframes ffl-circle {{ to {{ stroke-dashoffset:0; }} }}
+            @keyframes ffl-check {{ to {{ stroke-dashoffset:0; }} }}
+            .ffl-success-title {{
+                font-family:'Playfair Display', serif; color:#F1D98B;
+                font-size:22px; margin-top:18px; font-weight:700;
+            }}
+            .ffl-success-sub {{ color:#b8b3a8; font-size:14px; margin-top:8px; }}
+        `;
+        doc.head.appendChild(style);
+
+        const overlay = doc.createElement('div');
+        overlay.id = 'ffl-booking-success-overlay';
+        overlay.innerHTML = `
+            <div class="ffl-success-card">
+                <div class="ffl-check-circle">
+                    <svg viewBox="0 0 52 52">
+                        <circle cx="26" cy="26" r="23"></circle>
+                        <path d="M14 27l7 7 17-17"></path>
+                    </svg>
+                </div>
+                <div class="ffl-success-title">Appointment Booked!</div>
+                <div class="ffl-success-sub">{service} &middot; {pretty_date} at {appt_time}</div>
+            </div>
+        `;
+        doc.body.appendChild(overlay);
+        requestAnimationFrame(() => overlay.classList.add('ffl-show'));
+
+        setTimeout(() => {{
+            overlay.classList.remove('ffl-show');
+            setTimeout(() => {{ overlay.remove(); style.remove(); }}, 400);
+        }}, 2200);
+    }})();
+    </script>
+    """
+    components.html(html, height=0)
+
+
 init_db()
 
 # ----------------------------------------------------------------------------
@@ -3597,19 +3688,32 @@ def render_book_now():
                         st.session_state.user = None
                         st.rerun()
 
+            booking_success = st.session_state.pop("booking_success_info", None)
+            if booking_success:
+                render_booking_success_overlay(booking_success)
+
             pending = get_pending_appointment(user["id"])
             if pending:
                 _pid, p_service, p_price, p_date, p_time = pending
                 pretty_date = datetime.strptime(p_date, "%Y-%m-%d").strftime("%b %d, %Y")
+                if booking_success:
+                    title = "You're All Set!"
+                    sub = (
+                        f"{p_service} on {pretty_date} at {p_time} · {p_price} is booked. "
+                        "You can book your next haircut once this one's done."
+                    )
+                else:
+                    title = "You've already got one on the books"
+                    sub = (
+                        f"{p_service} on {pretty_date} at {p_time} · {p_price} hasn't happened yet. "
+                        "You can book your next haircut once this one's done — or cancel it below "
+                        "first if your plans changed."
+                    )
                 raw_html(
                     f"""
                     <div class="appt-card" style="flex-direction:column; align-items:center; text-align:center; gap:6px; padding:36px 24px;">
-                        <div class="appt-service">You've already got one on the books</div>
-                        <p style="margin:6px 0 4px 0; color:#847f72;">
-                            {p_service} on {pretty_date} at {p_time} · {p_price} hasn't happened yet.
-                            You can book your next haircut once this one's done — or cancel it below
-                            first if your plans changed.
-                        </p>
+                        <div class="appt-service">{title}</div>
+                        <p style="margin:6px 0 4px 0; color:#847f72;">{sub}</p>
                     </div>
                     """
                 )
@@ -3743,7 +3847,22 @@ def render_book_now():
                                 credit_cents_to_apply=credit_to_apply,
                             )
                         if ok:
-                            st.success("Appointment booked! See it below.")
+                            # Stashed instead of an immediate st.success() +
+                            # st.rerun(): that combo used to show the toast
+                            # for a single frame before the rerun wiped it,
+                            # then land the customer on the "you already
+                            # have an appointment" guard card with zero
+                            # acknowledgment that THIS booking was the one
+                            # that just went through. Stashing it lets the
+                            # next run show a proper full-screen checkmark
+                            # first (render_booking_success_overlay) and
+                            # word that guard card as a confirmation instead
+                            # of a block.
+                            st.session_state.booking_success_info = {
+                                "service": SERVICES[service_key]["label"],
+                                "date": appt_date.strftime("%a, %b %d, %Y"),
+                                "time": appt_time,
+                            }
                             st.rerun()
                         else:
                             st.error(msg)
