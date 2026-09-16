@@ -1,3 +1,6 @@
+#.\.venv\Scripts\Activate.ps1; streamlit run app.py
+#git add .; git commit -m "Update website"; git push
+
 import streamlit as st
 import streamlit.components.v1 as components
 import libsql
@@ -1853,6 +1856,143 @@ def notify_reschedule(name, email, service, old_date_iso, old_time, new_date_iso
             f"<p>Old time: {old_details}<br>New time: <strong>{new_details}</strong></p>"
         ),
     )
+
+
+# ----------------------------------------------------------------------------
+# BOOKING FREQUENCY (per-customer "usually books every N days" + an alert to
+# the owner when someone goes noticeably quiet)
+# ----------------------------------------------------------------------------
+# How a customer's average gap is computed: every Confirmed appointment they
+# have (past or future, whether or not Freddie has punched it - counts as
+# "booked" either way), ordered by date, gap = days between consecutive
+# bookings, averaged. Needs at least 2 Confirmed appointments to mean
+# anything; with only 0 or 1, there's no gap to measure yet.
+FREQUENCY_OVERDUE_THRESHOLD_DAYS = 7  # how many days past their usual gap before Freddie gets a heads-up
+FREQUENCY_ALERTS_SETTINGS_KEY = "_frequency_alerts_sent"  # {user_id (str): last_appt_date_iso we already alerted for}
+
+
+def get_customer_frequency(user_id):
+    """Returns (avg_gap_days, last_appt_date) for one customer, using every
+    Confirmed appointment on file (past or future) ordered by date.
+    avg_gap_days is None if there's fewer than 2 Confirmed appointments to
+    measure a gap from. last_appt_date is the most recent Confirmed
+    appointment's date (a date object), or None if they have none."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT appt_date FROM appointments WHERE user_id = ? AND status = 'Confirmed' "
+        "ORDER BY appt_date ASC",
+        (user_id,),
+    ).fetchall()
+    if not rows:
+        return None, None
+    dates = [datetime.strptime(r[0], "%Y-%m-%d").date() for r in rows]
+    last_appt_date = dates[-1]
+    if len(dates) < 2:
+        return None, last_appt_date
+    gaps = [(dates[i] - dates[i - 1]).days for i in range(1, len(dates))]
+    avg_gap_days = sum(gaps) / len(gaps)
+    return avg_gap_days, last_appt_date
+
+
+def format_frequency_label(avg_gap_days):
+    """'every ~38 days' style label for the Customers page. Returns None if
+    there's not enough history yet."""
+    if avg_gap_days is None:
+        return None
+    days = round(avg_gap_days)
+    if days <= 0:
+        days = 1
+    return f"every ~{days} day{'s' if days != 1 else ''}"
+
+
+def _get_frequency_alerts_sent():
+    raw = get_setting(FREQUENCY_ALERTS_SETTINGS_KEY, "")
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+
+
+def _save_frequency_alerts_sent(alerts):
+    set_setting(FREQUENCY_ALERTS_SETTINGS_KEY, json.dumps(alerts))
+
+
+def check_customer_frequencies():
+    """Looks at every customer with enough booking history, and if someone
+    is overdue by more than FREQUENCY_OVERDUE_THRESHOLD_DAYS days past their
+    own usual gap, emails the owner a heads-up. Safe to call often - only
+    ever sends ONE alert per customer per "overdue stretch" (tracked by
+    that customer's last known appt_date, stored in settings), so it won't
+    re-alert every time this runs, but WILL alert again if they go quiet
+    again after a future booking. Meant to be called both from the
+    Customers page and from the external reminder_worker.py cron job, so
+    the owner gets the alert whether or not anyone happens to have that
+    page open."""
+    conn = get_conn()
+    customers = conn.execute("SELECT id, name, email FROM users").fetchall()
+    today = date.today()
+    alerts_sent = _get_frequency_alerts_sent()
+    changed = False
+
+    for user_id, name, email in customers:
+        avg_gap_days, last_appt_date = get_customer_frequency(user_id)
+        if avg_gap_days is None or last_appt_date is None:
+            continue  # not enough history to know their usual frequency yet
+
+        days_since_last = (today - last_appt_date).days
+        days_overdue = days_since_last - avg_gap_days
+        key = str(user_id)
+
+        if days_overdue > FREQUENCY_OVERDUE_THRESHOLD_DAYS:
+            # Already alerted for this exact "last booking" - don't resend
+            # every time the check runs. Once they book again, last_appt_date
+            # changes and a future quiet stretch can alert again.
+            if alerts_sent.get(key) == last_appt_date.isoformat():
+                continue
+            freq_label = format_frequency_label(avg_gap_days)
+            send_email(
+                OWNER_EMAIL,
+                f"{name} hasn't booked in a while",
+                email_wrapper(
+                    f"<p><strong>{name}</strong> usually books {freq_label}, "
+                    f"but it's been {days_since_last} days since their last appointment "
+                    f"({last_appt_date.strftime('%b %d, %Y')}).</p>"
+                    "<p>They'd normally have booked again by now - might be worth a check-in.</p>"
+                ),
+            )
+            # Also nudge the customer themselves - same overdue stretch, so
+            # it's tracked by the same alerts_sent entry and won't repeat
+            # every time this check runs, only once per quiet stretch.
+            if email:
+                send_email(
+                    email,
+                    "We miss you at FADEDFORLESS",
+                    email_wrapper(
+                        f"<p>Hey {name},</p>"
+                        f"<p>You usually come in {freq_label}, and it's been "
+                        f"{days_since_last} days since your last cut "
+                        f"({last_appt_date.strftime('%b %d, %Y')}).</p>"
+                        "<p>Due for a fresh one? Grab a time whenever works for you.</p>"
+                        f'<p style="text-align:center; margin:26px 0;">'
+                        f'<a href="{BOOK_NOW_URL}" style="display:inline-block; background:#D4AF37; '
+                        f'color:#0d0d0d; text-decoration:none; font-weight:700; padding:12px 26px; '
+                        f'border-radius:8px;">Book Now</a></p>'
+                        "<p>- FADEDFORLESS</p>"
+                    ),
+                )
+            alerts_sent[key] = last_appt_date.isoformat()
+            changed = True
+        else:
+            # No longer overdue (e.g. they booked again) - clear any stale
+            # alert record so a future quiet stretch can alert fresh.
+            if key in alerts_sent:
+                del alerts_sent[key]
+                changed = True
+
+    if changed:
+        _save_frequency_alerts_sent(alerts_sent)
 
 
 # ----------------------------------------------------------------------------
@@ -4637,6 +4777,12 @@ def render_customers():
                 unsafe_allow_html=True,
             )
 
+            # Checks every customer's booking frequency and emails the owner
+            # about anyone overdue - runs each time this page loads (also
+            # runs on a schedule via the external reminder_worker.py cron
+            # job, so it's not only checked when this tab happens to be open).
+            check_customer_frequencies()
+
             conn = get_conn()
             customers = conn.execute(
                 "SELECT id, name, phone FROM users ORDER BY name COLLATE NOCASE ASC"
@@ -4644,7 +4790,21 @@ def render_customers():
             for cust_id, cust_name, cust_phone in customers:
                 cust_appts = get_appointments(cust_id)
                 cust_notes = get_style_notes(cust_id)
+                avg_gap_days, last_appt_date = get_customer_frequency(cust_id)
+                freq_label = format_frequency_label(avg_gap_days)
                 with st.expander(f"{cust_name}" + (f" · {cust_phone}" if cust_phone else "")):
+                    if freq_label:
+                        days_since_last = (date.today() - last_appt_date).days
+                        overdue = days_since_last - avg_gap_days > FREQUENCY_OVERDUE_THRESHOLD_DAYS
+                        overdue_html = (
+                            ' <span style="color:#e0745a;">(overdue)</span>' if overdue else ""
+                        )
+                        raw_html(
+                            f'<p style="color:#847f72; margin:-4px 0 12px 0;">'
+                            f'Usually books <strong style="color:#EDEAE2;">{freq_label}</strong> '
+                            f'&middot; last booked {last_appt_date.strftime("%b %d, %Y")}'
+                            f'{overdue_html}</p>'
+                        )
                     st.markdown("**Appointments**")
                     if not cust_appts:
                         st.markdown(
@@ -5126,6 +5286,3 @@ raw_html(
     </div>
     """
 )
-
-#.\.venv\Scripts\Activate.ps1; streamlit run app.py
-#git add .; git commit -m "Update website"; git push
