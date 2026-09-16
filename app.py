@@ -1865,18 +1865,26 @@ def notify_reschedule(name, email, service, old_date_iso, old_time, new_date_iso
 # How a customer's average gap is computed: every Confirmed appointment they
 # have (past or future, whether or not Freddie has punched it - counts as
 # "booked" either way), ordered by date, gap = days between consecutive
-# bookings, averaged. Needs at least 2 Confirmed appointments to mean
-# anything; with only 0 or 1, there's no gap to measure yet.
+# bookings. Gaps under FREQUENCY_MIN_GAP_DAYS are thrown out before
+# averaging - those are almost always a cancel-and-immediately-rebook, not a
+# real "how often do they come in" signal, and left in they'd drag a
+# customer's whole average down to something meaningless. Needs at least 2
+# REAL (5+ day) gaps to mean anything; with fewer, there's not enough clean
+# data yet.
+FREQUENCY_MIN_GAP_DAYS = 5  # gaps shorter than this (rebook-after-cancel, etc.) don't count toward frequency
 FREQUENCY_OVERDUE_THRESHOLD_DAYS = 7  # how many days past their usual gap before Freddie gets a heads-up
 FREQUENCY_ALERTS_SETTINGS_KEY = "_frequency_alerts_sent"  # {user_id (str): last_appt_date_iso we already alerted for}
 
 
 def get_customer_frequency(user_id):
     """Returns (avg_gap_days, last_appt_date) for one customer, using every
-    Confirmed appointment on file (past or future) ordered by date.
-    avg_gap_days is None if there's fewer than 2 Confirmed appointments to
-    measure a gap from. last_appt_date is the most recent Confirmed
-    appointment's date (a date object), or None if they have none."""
+    Confirmed appointment on file (past or future) ordered by date. Gaps
+    shorter than FREQUENCY_MIN_GAP_DAYS (e.g. booked, cancelled, rebooked a
+    couple days later) are excluded before averaging, since they're noise,
+    not a real frequency signal. avg_gap_days is None if there isn't at
+    least one real (5+ day) gap to measure from. last_appt_date is the most
+    recent Confirmed appointment's date (a date object), or None if they
+    have none."""
     conn = get_conn()
     rows = conn.execute(
         "SELECT appt_date FROM appointments WHERE user_id = ? AND status = 'Confirmed' "
@@ -1889,14 +1897,18 @@ def get_customer_frequency(user_id):
     last_appt_date = dates[-1]
     if len(dates) < 2:
         return None, last_appt_date
-    gaps = [(dates[i] - dates[i - 1]).days for i in range(1, len(dates))]
-    avg_gap_days = sum(gaps) / len(gaps)
+    all_gaps = [(dates[i] - dates[i - 1]).days for i in range(1, len(dates))]
+    real_gaps = [g for g in all_gaps if g >= FREQUENCY_MIN_GAP_DAYS]
+    if not real_gaps:
+        return None, last_appt_date
+    avg_gap_days = sum(real_gaps) / len(real_gaps)
     return avg_gap_days, last_appt_date
 
 
 def format_frequency_label(avg_gap_days):
     """'every ~38 days' style label for the Customers page. Returns None if
-    there's not enough history yet."""
+    there's not enough clean history yet (caller should show something like
+    "Not enough data" in that case)."""
     if avg_gap_days is None:
         return None
     days = round(avg_gap_days)
@@ -4804,6 +4816,16 @@ def render_customers():
                             f'Usually books <strong style="color:#EDEAE2;">{freq_label}</strong> '
                             f'&middot; last booked {last_appt_date.strftime("%b %d, %Y")}'
                             f'{overdue_html}</p>'
+                        )
+                    elif last_appt_date:
+                        # Has appointment history, but not enough clean (5+
+                        # day) gaps to trust a frequency number yet - e.g.
+                        # only one booking so far, or their bookings so far
+                        # were all cancel-and-immediately-rebook.
+                        raw_html(
+                            f'<p style="color:#847f72; margin:-4px 0 12px 0;">'
+                            f'Frequency: <strong style="color:#EDEAE2;">Not enough data</strong> '
+                            f'&middot; last booked {last_appt_date.strftime("%b %d, %Y")}</p>'
                         )
                     st.markdown("**Appointments**")
                     if not cust_appts:
